@@ -102,40 +102,46 @@ Make the envelopes in the same way as [`envelopes.py`](https://github.com/h0ffma
     Thus, use the time of the *last update* as the event time.
   - The minimum color level. The host uses `severity_level`.
   - The keyword filters.
-  - Your rules run in their registration order. A rule of yours that raises is
-    skipped with a warning: it does not stop the push of the events of the
-    other sources.
+  - Your rules run in their registration order. If a rule raises or returns a
+    value that is not a `RuleDecision`, the host logs a warning and accepts the
+    event. Thus, a broken rule does not block the events of the other sources.
 - Push: session targets and weather aggregation.
 - Reliability:
   - One shared HTTP session.
   - A timeout for each fetch.
   - A timeout of one minute for each delivery to the host. A delivery that
-    stalls returns to your poller and is tried again at the next poll.
+    stalls stays in `pending` and is tried again at the next poll.
   - A longer wait after each failure (exponential backoff).
-  - Not more than one error log message in each period.
-  - An event that the host did not handle goes to the host again at the next
-    poll. Your poller keeps at most 100 such events: a poll with more
-    failures keeps the newest ones and logs the count that it dropped.
-  - Those events survive a stop and a start of the same service instance
-    (your pollers resume with them) and a load of your extension that fails
-    (it stays enabled, and its pollers resume when it loads again). A
-    reload of the plugin makes a new manager with no pending events: send
-    an event that you still want delivered.
+  - Not more than one error log message in each 600-second period per poller.
+  - An event that the host did not handle stays in `pending` and goes to the
+    host again at the next poll. After the delivery step of a poll finishes,
+    your poller caps `pending` at the newest 100 events and drops older ones. If
+    a stop cancels a delivery in flight, `pending` can exceed 100 until the next
+    poll finishes delivery. The drop warning shares the 600-second log throttle
+    with fetch and delivery errors.
+  - `pending` and the recorded identities live in the memory of the manager.
+    They survive a stop and a start of the same manager instance, and they
+    survive a failed reload when your extension stays in `enabled_ids`. A
+    reload of the plugin or a new process creates a new manager with empty
+    memory; return any event that you still want delivered.
 - Translation: `api.t(key, **fmt)` looks in `locale/<language>.json`, then in `locale/zh-CN.json`.
   If `api.t` does not find the key, it gives the key itself.
 
 ### The fetch contract
 
-Return only **new or changed** events, not the current list of all alerts. The
-host keeps the identity (`unique_key` plus `published_at`) of every envelope
-that it delivered, and it does not deliver an unchanged envelope again:
+Prefer to return only **new or changed** events. Each polling task records the
+identity (`unique_key` plus `published_at`, or `unique_key` when `published_at`
+is empty) when `fetch()` returns an envelope, before delivery. Each polling task
+keeps only the **1024 most recently recorded identities**:
 
-- An alert that you send again with the same identity and the same
-  `published_at` is skipped. One poller remembers the newest 1024
-  identities: an identity older than that is forgotten, and the host
-  delivers its envelope again if you return it.
+- An alert that `fetch()` returns again while its identity is among those 1024
+  identities is skipped. Because the identity is recorded at fetch time,
+  envelopes whose delivery fails or is rejected also take a slot in those 1024
+  identities. Failed envelopes are retried from `pending`. Once more than 1024
+  newer identities are recorded, the oldest identity is evicted, and returning
+  it again delivers it again.
 - An update of the same alert passes when you give the same `event_id` a new
-  `published_at` (for example the time of the last update of the alert).
+  `published_at`, such as the last update time of the alert.
 - An envelope whose `source_id` is not the source of your poller is rejected.
   Build the envelope for the source that you registered.
 

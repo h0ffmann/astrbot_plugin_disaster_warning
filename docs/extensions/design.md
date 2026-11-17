@@ -21,7 +21,8 @@ An extension is a Python package. The host looks for extensions in two root dire
    `data_dir` is `StarTools.get_data_dir("astrbot_plugin_disaster_warning")`.
 
 If two roots contain the same `id`, the host uses the first root. The host records the
-second one as an error.
+second one as an error. If the host cannot read a root directory, it logs a warning and
+continues with the other root.
 
 The host scans both root directories. An extension on disk that is not in `enabled_ids` has the
 state `disabled` in `status()`. The host reads its manifest, but does not import its code.
@@ -51,11 +52,11 @@ permissions: [network]     # register_poller needs "network"
 dependencies: [other_ext]  # optional; extension ids that must load first
 ```
 
-`dependencies` is a list of extension ids. The host loads each dependency
-before the extension that names it, whatever the order of `enabled_ids`. An
-extension whose dependency is not enabled, whose dependency failed to load, or
-that sits in a dependency cycle gets the `error` state and does not load.
-The host records the reason in the status list.
+`dependencies` is an optional list of extension ids (`[a-z0-9_]+`). An extension cannot list
+its own `id`. The host loads each dependency before the extension that names it, whatever the
+order of `enabled_ids`. If a dependency is not enabled, fails to load, or forms a cycle, the
+dependent extension gets the `error` state and does not load. The host records the reason in
+`status()`.
 
 ## 2. Configuration
 
@@ -63,12 +64,15 @@ The host records the reason in the status list.
 
 ```json
 "extensions": {
-  "enabled_ids": [],        // the IDs of the extensions to load
+  "enabled_ids": [],        // the ids of the extensions to load
   "settings": "{}"          // JSON text: {"<id>": {...private settings...}}
 }
 ```
 
-`settings` can also be a dict. If the JSON text is not valid, the host writes a log message and uses `{}`.
+If `extensions` is not a mapping, the host logs a warning and uses `{}`. A string in
+`enabled_ids` is treated as one extension `id`, not one character per `id`. Any other
+non-list value in `enabled_ids` is ignored with a warning. `settings` can be JSON text or a
+dict; if the JSON text is not valid or does not decode to a dict, the host uses `{}`.
 
 ## 3. Host registry functions
 
@@ -79,7 +83,7 @@ items of an extension if its `setup` fails. The built-in behavior does not chang
 |---|---|
 | `core/sources/source_entry.py` | New enum member `ProviderFamily.EXTENSION = "extension"` |
 | `core/sources/source_catalog.py` | `register_source_entry(entry, *, owner) -> None`. It raises ValueError for a duplicate `source_id` and rebuilds all `SOURCE_IDS_BY_*` indexes. `unregister_source_entries(owner) -> list[str]`. `get_source_owner(source_id) -> str \| None`, which gives None for a built-in source. |
-| `core/parsers/parser_registry.py` | `register_parser(parser_name, parser_class, *, owner)` and `unregister_parsers(owner)` |
+| `core/parsers/parser_registry.py` | `register_parser(parser_name, parser_class, *, owner)`, `unregister_parsers(owner)` and `missing_catalog_parser_names() -> dict[str, str]`. |
 | `core/message/presenters/presenter_registry.py` | `register_text_presenter(key, presenter_class, *, owner)` and `unregister_presenters(owner)`. The integrity check includes the registered keys. |
 | `core/rules/rule_chain.py` | `register_rule(rule, *, after="local_rule", owner)` puts the rule after the built-in rule with that `rule_name`. If no rule has that name, it puts the rule at the end. `unregister_rules(owner)`. `build_default_rule_chain()` includes the registered rules. |
 
@@ -88,32 +92,37 @@ An extension source uses `config_group="extensions"` and `config_key=<source_id>
 the `data_sources` switches use this rule (`SourceEnabledRule`, `SourceRuntimeQueryService`,
 `_is_source_enabled_by_catalog`). The MVP does not support session overrides for extension sources.
 
-Rules of extensions run **in their registration order** after their anchor: when two extensions
-register rules after the same built-in rule, the first registration runs first. A rule of an
-extension that raises during `evaluate()` is isolated: the host logs a warning and continues
-the chain, so one broken rule cannot block the events of the other sources.
+Extension rules run **in their registration order** after their anchor. When two extensions
+register rules after the same built-in rule, the first registration runs first. An extension
+rule is wrapped in `_IsolatedRule`. If `evaluate()` raises or returns a value that is not a
+`RuleDecision`, the host logs a warning and accepts the event. One broken rule cannot block
+the events of the other sources.
 
-The load boundary of an extension validates its parser references: a source whose
-`parser_name` has no registered parser puts only that extension in the `error` state. The
-host itself then still starts (`validate_catalog_parser_names()` finds nothing missing).
+The load boundary of an extension validates its parser references. If a source names an
+unregistered `parser_name`, only that extension enters the `error` state and rolls back. The
+host still starts because `validate_catalog_parser_names()` finds no missing parser.
 
 ### Weather severity
 
-`WeatherEvent.metadata["severity_level"]` is an optional `int`: 0 is white, 1 is blue, 2 is
-yellow, 3 is orange and 4 is red. If the value is set, `WeatherRule` and the weather
-aggregation service use it. If the value is not set, the host finds the color word in the
-Chinese title, as before.
+`WeatherEvent.metadata["severity_level"]` is an optional `int` (not a `bool`). Values 0 to 4 mean
+white, blue, yellow, orange and red. If `WeatherEvent.metadata` is a `dict` and
+`severity_level` is in `0..4`, `WeatherRule` and `WeatherAggregationService` use it. If the
+value is not set or not valid, the host finds the color word in the Chinese title, as before.
 
 ## 4. ExtensionAPI (the argument of `setup(api)`)
 
 ```python
 class ExtensionAPI:
+    MIN_INTERVAL_SECONDS = 60
+
     id: str
     version: str
     config: dict            # the private settings of the extension (extensions.settings[id])
     logger                  # a logger that adds the prefix "[扩展:<id>]"
     data_dir: pathlib.Path  # <data_dir>/extensions_data/<id>/; the host makes it when necessary
     host_version: str
+    sources: list[str]
+    pollers: list[PollerSpec]
     models: types.SimpleNamespace  # host classes; extensions do not import host modules
     # SourceEntry, SourceType, ProviderFamily, FusionRole, WeatherEvent, EventEnvelope,
     # EventIdentity, SourcePayload, RuleDecision
@@ -128,8 +137,8 @@ class ExtensionAPI:
         source_id: str,
         fetch,                   # async def fetch(session: aiohttp.ClientSession) -> list[EventEnvelope]
         *,
-        interval_seconds: int,   # the minimum value is 60
-        timeout_seconds: int = 30,
+        interval_seconds: float, # clamped to at least MIN_INTERVAL_SECONDS (60)
+        timeout_seconds: float = 30,
     ) -> None: ...
 ```
 
@@ -137,7 +146,8 @@ class ExtensionAPI:
   in different installations. Use `api.models`.
 - A presenter is any class with the classmethod `present(display_context, options) -> str`.
   For weather events, `display_context` has `.title`, `.headline`, `.metadata` and `.source_id`.
-  `.metadata` contains `WeatherEvent.metadata`.
+  For extension sources, `.metadata` merges `WeatherEvent.metadata` over the envelope metadata,
+  while keeping the host fields (`event_id`, `source_id`, `event_type`, `description`).
 - A rule is any object with `rule_name: str` and `evaluate(context) -> RuleDecision`.
 - `register_source` raises ValueError if `entry.config_group` is not `"extensions"`.
   It also raises ValueError if `entry.provider_family` is not `ProviderFamily.EXTENSION`.
@@ -154,64 +164,71 @@ class ExtensionAPI:
 `core/extensions/manager.py` contains `ExtensionManager(service, host_registry)`.
 
 - `DisasterWarningService.__init__` calls `load_all()` one time, **before** `_initialize_parsers()`.
-  Thus, the host makes the extension parsers in the same way as the built-in parsers.
-  Before it loads an extension, `load_all()` checks the id of every entry in `enabled_ids`
-  against `[a-z0-9_]+` and checks that the extension directory is inside a root: an id with
-  a path traversal, or a root that the host cannot read, loads nothing and stops nothing.
-  The extensions configuration is validated the same way: a value that is not a mapping is
-  ignored with a warning, and a string in `enabled_ids` is one id, not one character per id.
-  For each ID in `enabled_ids`, `load_all()` does these steps:
-  1. It finds and reads the manifest. The extensions in `dependencies` load first.
-  2. It checks `api_version` and `min_host_version`.
-  3. It imports the entry module and calls `setup(api)`.
-  4. It validates the parser references of the sources of the extension.
+  Thus, the host builds the extension parsers in the same way as the built-in parsers.
+  Before loading an extension, `load_all()` checks each `id` in `enabled_ids` against
+  `[a-z0-9_]+`. The resolved extension directory must be a direct child of a configured root.
+  Thus, a path traversal or symlink cannot load code outside the roots.
+  For each `id` in `enabled_ids`, `load_all()` runs these steps:
+  1. Find and read the manifest after loading any `dependencies`.
+  2. Check `api_version` and `min_host_version`.
+  3. Clear any prior `_dw_ext_<id>` modules and registrations, import the entry module, and call `setup(api)`.
+  4. Validate the parser references of the sources that the extension registered.
 
-  If a step raises an exception, the manager does these steps:
-  - It sets the state of the extension to `error` and keeps the message.
-  - It calls each `unregister_*(owner=id)` function.
-  - It writes a warning to the log.
-  - It continues with the next extension.
-- The lifecycle start calls `start()`. The manager starts one asyncio task for each poller.
-  The manager serializes `start()` and `stop()` with one lock: the service locks of the
-  host (`_start_lock`, `_stop_lock`) do not exclude each other, so a start that runs
-  while a stop is in flight waits for it:
-  - All pollers use one `aiohttp.ClientSession`. The session uses the certifi root certificates.
+  If a step raises an exception, the manager runs these steps:
+  - Set the state of the extension to `error` and keep the message.
+  - Purge the imported `_dw_ext_<id>` modules and call each `unregister_*(owner=id)` function.
+  - Write a warning to the log and continue with the next extension.
+- The lifecycle start calls `start()`. The manager serializes `start()` and `stop()` with one
+  manager-level `asyncio.Lock`, because the host locks (`_start_lock`, `_stop_lock`) do not
+  exclude each other. A `start()` that runs while a `stop()` is in flight waits for `stop()` to
+  finish. After a completed `stop()` on the same manager, `start()` calls `load_all()` again and
+  starts one asyncio task for each poller:
+  - All pollers share one `aiohttp.ClientSession` with the `certifi` root certificates.
   - The manager calls `fetch` with `asyncio.wait_for(timeout_seconds)`.
-  - The manager sends each envelope to `await service._handle_disaster_event(envelope)`.
-    Each call has its own try/except and a delivery timeout of one minute: a handler that
-    stalls returns the envelope to the poller instead of stopping its collection. An
-    envelope leaves the pending list when the host handles it: a stop between two
-    envelopes keeps every envelope that did not finish, so the poller loses nothing.
-  - An envelope whose `source_id` is not the source of the polling task is rejected. An
-    extension cannot speak for another source, built-in or extension.
-  - The host keeps the identity of every envelope that it delivered. An envelope with the
-    same identity (`unique_key` plus `published_at`) is not delivered again: a poller that
-    returns the current alert snapshot does not push an unchanged alert twice. An update
-    passes when the extension gives the same `event_id` a new `published_at`. One polling
-    task keeps the newest 1024 identities (`MAX_SEEN_EVENTS`): an identity older than
-    that is forgotten, and a poller that returns it again then delivers it again.
-  - If an exception occurs, the manager writes a log message (not more than one in each period).
-    Then it waits longer before the next attempt (exponential backoff). The maximum wait is 10 times the interval.
-    A poller task does not stop because of an exception.
-  - An envelope that the host did not handle stays in `pending` and goes to the host again
-    at the next poll. The poller keeps at most 100 failed envelopes: when a cycle drops
-    them, it logs the count, it does not discard them in silence.
-  - `pending` and the delivered identities live in the memory of the manager. They survive
-    the `stop()` and the `start()` of the same manager (a service restart loads the
-    extensions again, restarts the pollers, and delivers the envelopes that `stop()`
-    interrupted), and the load of an extension that fails: an extension that stays
-    enabled keeps its state, and its pollers resume with it when it loads again. A
-    reload of the plugin and a new process make a new manager: they start with no
-    pending envelopes, and an extension that wants an event delivered after a reload
-    must send it again.
-- `stop()` cancels the poller tasks and closes the session. The lifecycle drains the weather
-  aggregation buffer **before** `stop()` unregisters the extension sources and presenters:
-  buffered extension events keep their extension presentation.
+  - Each polling task records the identity (`unique_key` plus `published_at`, or `unique_key`
+    when `published_at` is empty) when `fetch()` returns an envelope, before delivery. Each
+    polling task keeps only the **1024 most recently recorded identities** (`MAX_SEEN_EVENTS`).
+    Because registration happens at fetch time, envelopes whose delivery fails or is rejected
+    also take a slot in those 1024 identities. While an identity stays in that set, the poller
+    skips a fetched envelope with the same identity. An update passes when the extension gives
+    the same `event_id` a new `published_at`. When more than 1024 newer identities are recorded,
+    the oldest identity is evicted, and returning it again delivers it again.
+  - New envelopes join the `pending` list before delivery. The manager sends each envelope in
+    `pending` to `await service._handle_disaster_event(envelope)` with a delivery timeout of one
+    minute (`DELIVERY_TIMEOUT_SECONDS = 60`). Each call has its own `try`/`except`, so a stalled
+    handler returns the envelope to `pending` instead of blocking the poller. An envelope leaves
+    `pending` in place as soon as the host handles it (`handled is not False`). If `stop()`
+    cancels the task between two envelopes, every unfinished envelope remains in `pending`.
+  - An envelope whose `source_id` does not match the `source_id` of the polling task is removed
+    from `pending` and rejected. An extension cannot speak for another source, built-in or
+    extension.
+  - An envelope whose delivery returns `False`, times out, or raises stays in `pending` for the
+    next poll. Retries from `pending` do not check `_seen` again. After the delivery step of a
+    poll cycle finishes, `pending` keeps at most the newest 100 envelopes
+    (`MAX_PENDING_ENVELOPES`) and drops older ones. If `stop()` cancels the task during
+    delivery, `pending` can hold more than 100 envelopes until the next poll finishes its
+    delivery step. The drop warning shares the per-poller log throttle
+    (`LOG_THROTTLE_SECONDS = 600`) with fetch and delivery warnings. Thus, the dropped count is
+    logged only when the throttle allows a warning in that period.
+  - If `fetch` raises an exception, the manager logs a throttled warning (at most one per
+    `LOG_THROTTLE_SECONDS` period). It then waits with exponential backoff (`2**failures` times
+    the interval, up to 10 times the interval). A poller task does not stop on an exception.
+  - `pending` and the recorded identities (`_seen`) live in the memory of the manager. They
+    survive `stop()` and `start()` on the same manager instance. They also survive a failed
+    reload when the extension stays in `enabled_ids` (`_drop_stale_poll_state` drops only
+    extensions removed from `enabled_ids`). A plugin reload or a new process creates a new
+    manager with empty memory. An extension that wants an event delivered after a reload must
+    return it again.
+- `stop()` cancels the poller tasks, closes the HTTP session, and unregisters the extension
+  sources, parsers, presenters and rules. During shutdown, `DisasterServiceLifecycle` calls
+  `weather_agg.flush_all()` **before** `extension_manager.stop()`, so buffered extension weather
+  events still resolve their extension sources and presenters.
 - `status() -> list[dict]` gives `[{id, name, version, state, error, sources}]`.
   `state` is `"loaded"`, `"error"`, `"not_found"` or `"disabled"`. The admin command `/灾害预警扩展` shows this list.
 
-`host_registry` is a small object with the functions of section 3. The production object is in
-`core/extensions/host_registry.py`. Tests use a fake object.
+`host_registry` is a small adapter with the functions of section 3 (`HostRegistry` in
+`core/extensions/host_registry.py`, plus `missing_source_parser_names(owner)`). Tests can pass a
+fake registry.
 
 ## 6. Items that are not in the MVP
 
