@@ -382,19 +382,12 @@ class DisasterServiceLifecycleService:
                 await self.cancel_and_wait(background_tasks)  # 终止并回收通用后台任务
                 self.service.background_tasks.clear()
 
-                # Stop the extension polling tasks and close their HTTP session.
-                extension_manager = getattr(self.service, "extension_manager", None)
-                if extension_manager is not None:
-                    await extension_manager.stop()
-
-                # 任务回收完成后，再逐项释放底层基础设施资源。
-                if getattr(self.service, "notification_center", None):
-                    await self.service.notification_center.stop()  # 停止网页端通知服务
-
                 # 停机前推送气象预警聚合缓冲区中尚未发送的事件，避免丢失。
                 # 必须放在 ws_manager.stop() 之前：此时底座连接仍然可用，
                 # 合并转发能成功；若等连接销毁后再推送，发送必然失败。
                 # 此时 WebSocket 连接协程已被取消，不会再有新事件进入缓冲，安全。
+                # 也必须放在扩展管理器停止之前：缓冲区中的扩展事件要用扩展的
+                # 展示器渲染，先冲刷缓冲，再注销扩展的源与展示器。
                 weather_agg = getattr(
                     self.service, "_weather_aggregation_service", None
                 )
@@ -405,6 +398,15 @@ class DisasterServiceLifecycleService:
                         logger.debug(
                             f"[灾害预警] 停机时推送气象预警聚合缓冲区失败（已忽略）: {flush_err}"
                         )
+
+                # Stop the extension polling tasks and close their HTTP session.
+                extension_manager = getattr(self.service, "extension_manager", None)
+                if extension_manager is not None:
+                    await extension_manager.stop()
+
+                # 任务回收完成后，再逐项释放底层基础设施资源。
+                if getattr(self.service, "notification_center", None):
+                    await self.service.notification_center.stop()  # 停止网页端通知服务
 
                 await self.service.ws_manager.stop()  # 关闭并断开所有活跃的底座网络连接
 

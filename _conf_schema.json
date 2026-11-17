@@ -1535,7 +1535,7 @@
       "enabled_ids": {
         "description": "启用的扩展 ID 列表",
         "type": "list",
-        "hint": "填写要加载的扩展 ID，每行一个，例如 my_ext。扩展目录位于插件目录 extensions/ 或数据目录 extensions/ 下。某个扩展加载失败只会跳过该扩展，不影响插件其他功能",
+        "hint": "填写要加载的扩展 ID，每行一个，例如 my_ext。ID 只能包含小写字母、数字和下划线，且需与扩展目录名一致。扩展目录位于插件目录 extensions/ 或数据目录 extensions/ 下。某个扩展加载失败只会跳过该扩展，不影响插件其他功能",
         "default": []
       },
       "settings": {

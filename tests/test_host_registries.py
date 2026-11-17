@@ -177,6 +177,38 @@ def test_rule_round_trip_and_position():
     assert [r.rule_name for r in rule_chain.build_default_rule_chain().rules] == base
 
 
+def _named_rule(name: str):
+    class _NamedRule:
+        rule_name = name
+
+        def evaluate(self, context):
+            return rule_result.RuleDecision.accept(reason=name)
+
+    return _NamedRule()
+
+
+def test_extension_rules_run_in_registration_order():
+    """Check that rules with the same anchor keep their registration order.
+
+    The second registration must run AFTER the first one, not before it.
+    """
+    base = [r.rule_name for r in rule_chain.build_default_rule_chain().rules]
+    rule_chain.register_rule(_named_rule("ext_rule_one"), owner=OWNER)
+    rule_chain.register_rule(_named_rule("ext_rule_two"), owner=OWNER)
+    rule_chain.register_rule(
+        _named_rule("ext_rule_three"), after="source_rule", owner=OWNER
+    )
+    names = [r.rule_name for r in rule_chain.build_default_rule_chain().rules]
+    # The rules of the anchor `local_rule` run in their registration order.
+    assert names.index("ext_rule_one") == names.index("local_rule") + 1
+    assert names.index("ext_rule_two") == names.index("ext_rule_one") + 1
+    # A rule at another anchor does not move them.
+    assert names.index("ext_rule_three") == names.index("source_rule") + 1
+    assert set(names) == set(base) | {"ext_rule_one", "ext_rule_two", "ext_rule_three"}
+    rule_chain.unregister_rules(OWNER)
+    assert [r.rule_name for r in rule_chain.build_default_rule_chain().rules] == base
+
+
 def _weather_envelope(title="暴雨", metadata=None, source_id=SOURCE_ID):
     ident = event_identity.EventIdentity(
         event_id="ext-1", source_id=source_id, event_type="weather_alarm"

@@ -7,6 +7,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import yaml
 
@@ -33,11 +34,17 @@ class Manifest:
     author: str
     permissions: tuple[str, ...]
     path: Path  # Extension directory
+    dependencies: tuple[str, ...] = ()  # Extension ids that must load first
 
 
 def parse_version(text: str) -> tuple[int, ...]:
     """Convert a version such as "v1.6.5" to a tuple of integers."""
     return tuple(int(n) for n in re.findall(r"\d+", str(text).lstrip("vV")))
+
+
+def is_valid_extension_id(text: str) -> bool:
+    """Check the format of an extension id. The id is one path segment."""
+    return isinstance(text, str) and bool(_ID_RE.fullmatch(text))
 
 
 def load_manifest(ext_dir: Path) -> Manifest:
@@ -71,6 +78,8 @@ def load_manifest(ext_dir: Path) -> Manifest:
     if not isinstance(permissions, list):
         raise ManifestError("permissions 必须是列表")
 
+    dependencies = _validate_dependencies(raw.get("dependencies"), ext_id)
+
     return Manifest(
         id=ext_id,
         name=str(raw.get("name") or ext_id),
@@ -82,7 +91,25 @@ def load_manifest(ext_dir: Path) -> Manifest:
         author=str(raw.get("author") or ""),
         permissions=tuple(str(p) for p in permissions),
         path=ext_dir,
+        dependencies=dependencies,
     )
+
+
+def _validate_dependencies(raw: Any, ext_id: str) -> tuple[str, ...]:
+    """Check the optional `dependencies` field: a list of extension ids."""
+    if raw is None:
+        return ()
+    if not isinstance(raw, list):
+        raise ManifestError("dependencies 必须是列表")
+    dependencies: list[str] = []
+    for item in raw:
+        if not is_valid_extension_id(item):
+            raise ManifestError(f"dependencies 项非法（需匹配 [a-z0-9_]+）: {item!r}")
+        if item == ext_id:
+            raise ManifestError("dependencies 不能包含自身")
+        if item not in dependencies:
+            dependencies.append(item)
+    return tuple(dependencies)
 
 
 def check_host_version(manifest: Manifest, host_version: str) -> None:

@@ -80,6 +80,9 @@ def setup(api):
     raise RuntimeError("setup failed on purpose")
 """
 
+# A source that references a parser_name that the extension does not register.
+SETUP_WITH_GHOST_PARSER = SETUP.replace('parser_name=""', 'parser_name="ghost_parser"')
+
 
 class _FakeService:
     def __init__(self, config):
@@ -233,6 +236,116 @@ def test_failing_extension_does_not_affect_the_others(tmp_path):
         _cleanup(FIRST, SECOND, "broken")
 
 
+def test_extension_with_unregistered_parser_is_isolated(tmp_path):
+    """A source that references an unregistered parser_name isolates the extension.
+
+    The host itself must still start: validate_catalog_parser_names() passes
+    after the rollback removed the source of the extension.
+    """
+    importlib.import_module("astrbot_plugin_disaster_warning.core.app.disaster_service")
+    from astrbot_plugin_disaster_warning.core.parsers.parser_registry import (
+        validate_catalog_parser_names,
+    )
+
+    root = tmp_path / "root"
+    _write_extension(root, FIRST)
+    _write_extension(root, "bad_parser", SETUP_WITH_GHOST_PARSER)
+    manager = _make_manager(tmp_path, [FIRST, "bad_parser"], [root])
+    try:
+        manager.load_all()
+        records = {r["id"]: r for r in manager.status()}
+        assert records[FIRST]["state"] == "loaded", records[FIRST]["error"]
+        assert records["bad_parser"]["state"] == "error"
+        assert "解析器" in records["bad_parser"]["error"]
+        # The rollback removed the source: the host starts with no missing parser.
+        validate_catalog_parser_names()
+    finally:
+        _cleanup(FIRST, "bad_parser")
+
+
+async def test_a_broken_extension_rule_does_not_block_events(two_loaded):
+    """A rule of an extension that raises must not stop the push decision of the host."""
+    importlib.import_module("astrbot_plugin_disaster_warning.core.app.disaster_service")
+    from astrbot_plugin_disaster_warning.core.message.push.push_policy import (
+        evaluate_push_decision_with_components,
+    )
+
+    rule_chain = importlib.import_module(
+        "astrbot_plugin_disaster_warning.core.rules.rule_chain"
+    )
+
+    class BrokenRule:
+        rule_name = "test_broken_ext_rule"
+
+        def evaluate(self, context):
+            raise RuntimeError("rule boom")
+
+    rule_chain.register_rule(BrokenRule(), owner=FIRST)
+    try:
+        envelope = await _first_event(two_loaded, SECOND)
+        runtime_config = {"weather_config": {"weather_filter": {"enabled": True}}}
+        decision = evaluate_push_decision_with_components(
+            envelope, runtime_config=runtime_config, policy_state={}
+        )
+        # The broken rule is isolated: the chain accepts, as it does without it.
+        assert decision.accepted, decision.reason
+    finally:
+        rule_chain.unregister_rules(FIRST)
+
+
+async def test_stop_flushes_the_weather_buffer_before_the_extensions():
+    """Check the shutdown order: drain the aggregation buffer before unregistering.
+
+    A buffered extension event needs its extension source and presenter when
+    the flush callback re-evaluates the rule chain (SourceEnabledRule rejects
+    an unregistered source). The flush must run before extension stop().
+    """
+    import asyncio
+    import types
+
+    importlib.import_module("astrbot_plugin_disaster_warning.core.app.disaster_service")
+    lifecycle_mod = importlib.import_module(
+        "astrbot_plugin_disaster_warning.core.app.runtime.disaster_service_lifecycle"
+    )
+
+    order = []
+
+    class FakePart:
+        def __init__(self, name):
+            self._name = name
+
+        async def stop(self):
+            order.append(self._name)
+
+    class FakeAggregation:
+        async def flush_all(self):
+            order.append("flush_all")
+
+    service = types.SimpleNamespace(
+        _stop_lock=asyncio.Lock(),
+        _stopping=False,
+        running=False,
+        stop_started_at=None,
+        connection_tasks=[],
+        scheduled_tasks=[],
+        background_tasks=[],
+        ws_manager=FakePart("ws_manager"),
+        http_fetcher=None,
+        statistics_manager=None,
+        _telemetry=None,
+        notification_center=None,
+        extension_manager=FakePart("extension_manager"),
+        _weather_aggregation_service=FakeAggregation(),
+    )
+    lifecycle = lifecycle_mod.DisasterServiceLifecycleService(service)
+    await lifecycle.stop()
+    # The buffered weather events leave the host before the extension
+    # registrations are removed and before the connections go down.
+    assert order.index("flush_all") < order.index("extension_manager")
+    assert order.index("flush_all") < order.index("ws_manager")
+    assert order.index("extension_manager") < order.index("ws_manager")
+
+
 async def test_unregister_one_leaves_the_other(two_loaded):
     """Check that the removal of one extension keeps the source and presenter of the other."""
     from astrbot_plugin_disaster_warning.core.message.presenters.presenter_registry import (
@@ -291,6 +404,24 @@ def test_built_in_source_ignores_event_metadata():
     """Check that the display metadata of a built-in source does not change."""
     metadata = _context({"status": "from_extension"}, provider_family="fan_studio")
     assert metadata["status"] == "from_display"
+
+
+def test_extension_merge_with_the_real_enum_provider_family():
+    """Check the merge when the descriptor carries the ProviderFamily enum member.
+
+    A SourceEntry (not the display SourceDescriptor) has the enum member in
+    provider_family. The merge must work for both the member and the value.
+    """
+    importlib.import_module("astrbot_plugin_disaster_warning.core.app.disaster_service")
+    from astrbot_plugin_disaster_warning.core.sources.source_entry import (
+        ProviderFamily,
+    )
+
+    metadata = _context(
+        {"status": "from_extension"}, provider_family=ProviderFamily.EXTENSION
+    )
+    assert metadata["status"] == "from_extension"
+    assert (metadata["event_id"], metadata["source_id"]) == ("host_id", "host_source")
 
 
 @pytest.mark.parametrize("metadata", [None, "text", 3, [1]])

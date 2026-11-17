@@ -58,6 +58,7 @@ version: 0.1.0
 api_version: 1
 min_host_version: 1.6.5
 permissions: [network]
+dependencies: []  # optional; extension ids that must load first
 ```
 
 ```python
@@ -101,14 +102,37 @@ Make the envelopes in the same way as [`envelopes.py`](https://github.com/h0ffma
     Thus, use the time of the *last update* as the event time.
   - The minimum color level. The host uses `severity_level`.
   - The keyword filters.
+  - Your rules run in their registration order. A rule of yours that raises is
+    skipped with a warning: it does not stop the push of the events of the
+    other sources.
 - Push: session targets and weather aggregation.
 - Reliability:
   - One shared HTTP session.
   - A timeout for each fetch.
+  - A timeout of one minute for each delivery to the host. A delivery that
+    stalls returns to your poller and is tried again at the next poll.
   - A longer wait after each failure (exponential backoff).
   - Not more than one error log message in each period.
+  - An event that the host did not handle goes to the host again at the next
+    poll. It survives a reload of the plugin and a restart of the service.
 - Translation: `api.t(key, **fmt)` looks in `locale/<language>.json`, then in `locale/zh-CN.json`.
   If `api.t` does not find the key, it gives the key itself.
+
+### The fetch contract
+
+Return only **new or changed** events, not the current list of all alerts. The
+host keeps the identity (`unique_key` plus `published_at`) of every envelope
+that it delivered, and it does not deliver an unchanged envelope again:
+
+- An alert that you send again with the same identity and the same
+  `published_at` is skipped.
+- An update of the same alert passes when you give the same `event_id` a new
+  `published_at` (for example the time of the last update of the alert).
+- An envelope whose `source_id` is not the source of your poller is rejected.
+  Build the envelope for the source that you registered.
+
+Also, do not let one event have the identity of another source: the identity
+`unique_key` is `source_id|event_type|event_id|report_num`.
 
 ## 4. Tests
 

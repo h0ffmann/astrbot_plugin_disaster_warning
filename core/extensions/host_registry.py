@@ -36,6 +36,22 @@ class HostRegistry:
 
         register_rule(rule, after=after, owner=owner)
 
+    def missing_source_parser_names(self, owner: str) -> dict[str, str]:
+        """Return {source_id: parser_name} of the owner for parsers that the host does not have.
+
+        The manager calls this after setup() of an extension. A source that
+        references an unregistered parser would stop the host from starting
+        (validate_catalog_parser_names). The manager isolates it instead.
+        """
+        from ..parsers.parser_registry import missing_catalog_parser_names
+        from ..sources.source_catalog import get_source_owner
+
+        return {
+            sid: name
+            for sid, name in missing_catalog_parser_names().items()
+            if get_source_owner(sid) == owner
+        }
+
     def unregister_source_entries(self, owner: str):
         """Remove all source entries of the owner from the host source catalog."""
         from ..sources.source_catalog import unregister_source_entries

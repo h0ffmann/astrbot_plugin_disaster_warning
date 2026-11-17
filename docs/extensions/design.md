@@ -48,7 +48,14 @@ entry: extension:setup     # optional; the default is "extension:setup"
 description: ...
 author: ...
 permissions: [network]     # register_poller needs "network"
+dependencies: [other_ext]  # optional; extension ids that must load first
 ```
+
+`dependencies` is a list of extension ids. The host loads each dependency
+before the extension that names it, whatever the order of `enabled_ids`. An
+extension whose dependency is not enabled, whose dependency failed to load, or
+that sits in a dependency cycle gets the `error` state and does not load.
+The host records the reason in the status list.
 
 ## 2. Configuration
 
@@ -80,6 +87,15 @@ An extension source uses `config_group="extensions"` and `config_key=<source_id>
 `config_group == "extensions"` is **enabled globally while it is registered**. All checks of
 the `data_sources` switches use this rule (`SourceEnabledRule`, `SourceRuntimeQueryService`,
 `_is_source_enabled_by_catalog`). The MVP does not support session overrides for extension sources.
+
+Rules of extensions run **in their registration order** after their anchor: when two extensions
+register rules after the same built-in rule, the first registration runs first. A rule of an
+extension that raises during `evaluate()` is isolated: the host logs a warning and continues
+the chain, so one broken rule cannot block the events of the other sources.
+
+The load boundary of an extension validates its parser references: a source whose
+`parser_name` has no registered parser puts only that extension in the `error` state. The
+host itself then still starts (`validate_catalog_parser_names()` finds nothing missing).
 
 ### Weather severity
 
@@ -139,10 +155,16 @@ class ExtensionAPI:
 
 - `DisasterWarningService.__init__` calls `load_all()` one time, **before** `_initialize_parsers()`.
   Thus, the host makes the extension parsers in the same way as the built-in parsers.
+  Before it loads an extension, `load_all()` checks the id of every entry in `enabled_ids`
+  against `[a-z0-9_]+` and checks that the extension directory is inside a root: an id with
+  a path traversal, or a root that the host cannot read, loads nothing and stops nothing.
+  The extensions configuration is validated the same way: a value that is not a mapping is
+  ignored with a warning, and a string in `enabled_ids` is one id, not one character per id.
   For each ID in `enabled_ids`, `load_all()` does these steps:
-  1. It finds and reads the manifest.
+  1. It finds and reads the manifest. The extensions in `dependencies` load first.
   2. It checks `api_version` and `min_host_version`.
   3. It imports the entry module and calls `setup(api)`.
+  4. It validates the parser references of the sources of the extension.
 
   If a step raises an exception, the manager does these steps:
   - It sets the state of the extension to `error` and keeps the message.
@@ -153,11 +175,26 @@ class ExtensionAPI:
   - All pollers use one `aiohttp.ClientSession`. The session uses the certifi root certificates.
   - The manager calls `fetch` with `asyncio.wait_for(timeout_seconds)`.
   - The manager sends each envelope to `await service._handle_disaster_event(envelope)`.
-    Each call has its own try/except.
+    Each call has its own try/except and a delivery timeout of one minute: a handler that
+    stalls returns the envelope to the poller instead of stopping its collection.
+  - An envelope whose `source_id` is not the source of the polling task is rejected. An
+    extension cannot speak for another source, built-in or extension.
+  - The host keeps the identity of every envelope that it delivered. An envelope with the
+    same identity (`unique_key` plus `published_at`) is not delivered again: a poller that
+    returns the current alert snapshot does not push an unchanged alert twice. An update
+    passes when the extension gives the same `event_id` a new `published_at`.
   - If an exception occurs, the manager writes a log message (not more than one in each period).
     Then it waits longer before the next attempt (exponential backoff). The maximum wait is 10 times the interval.
     A poller task does not stop because of an exception.
-- `stop()` cancels the poller tasks and closes the session.
+  - An envelope that the host did not handle stays in `pending` and goes to the host again
+    at the next poll. The poller keeps at most 100 failed envelopes: when a cycle drops
+    them, it logs the count, it does not discard them in silence.
+  - `pending` and the delivered identities live in the manager. They survive a `stop()`:
+    a `start()` of the same manager (a service restart) loads the extensions again, restarts
+    the pollers, and delivers the envelopes that stop() interrupted.
+- `stop()` cancels the poller tasks and closes the session. The lifecycle drains the weather
+  aggregation buffer **before** `stop()` unregisters the extension sources and presenters:
+  buffered extension events keep their extension presentation.
 - `status() -> list[dict]` gives `[{id, name, version, state, error, sources}]`.
   `state` is `"loaded"`, `"error"`, `"not_found"` or `"disabled"`. The admin command `/灾害预警扩展` shows this list.
 

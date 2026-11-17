@@ -50,6 +50,10 @@ class FakeRegistry:
         """Record the rule."""
         self.calls.append(("rule", after, owner))
 
+    def missing_source_parser_names(self, owner: str) -> dict:
+        """No parser reference is missing in the fake host."""
+        return {}
+
     def unregister_source_entries(self, owner):
         """Record the removal of the owner sources."""
         self.calls.append(("unreg_source", owner))
@@ -65,6 +69,67 @@ class FakeRegistry:
     def unregister_rules(self, owner):
         """Record the removal of the owner rules."""
         self.calls.append(("unreg_rule", owner))
+
+
+class StatefulRegistry(FakeRegistry):
+    """Fake host registry that stores the registrations, like the host registries.
+
+    The unregister methods remove the stored items, so a test can check that
+    they are gone, not only that an unregister method was called.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.sources: dict[str, str] = {}  # source_id -> owner
+        self.parsers: dict[str, str] = {}  # parser name -> owner
+        self.presenters: dict[str, str] = {}  # presenter key -> owner
+        self.rules: list[str] = []  # owners of the registered rules
+
+    def register_source_entry(self, entry, *, owner):
+        """Store the source entry."""
+        self.sources[entry.source_id] = owner
+        super().register_source_entry(entry, owner=owner)
+
+    def register_parser(self, name, cls, *, owner):
+        """Store the parser."""
+        self.parsers[name] = owner
+        super().register_parser(name, cls, owner=owner)
+
+    def register_text_presenter(self, key, cls, *, owner):
+        """Store the presenter."""
+        self.presenters[key] = owner
+        super().register_text_presenter(key, cls, owner=owner)
+
+    def register_rule(self, rule, *, after="local_rule", owner):
+        """Store the rule."""
+        self.rules.append(owner)
+        super().register_rule(rule, after=after, owner=owner)
+
+    def unregister_source_entries(self, owner):
+        """Remove the stored sources of the owner."""
+        removed = [sid for sid, o in self.sources.items() if o == owner]
+        for sid in removed:
+            del self.sources[sid]
+            self.calls.append(("unreg_source", sid, owner))
+        return removed
+
+    def unregister_parsers(self, owner):
+        """Remove the stored parsers of the owner."""
+        for name in [n for n, o in self.parsers.items() if o == owner]:
+            del self.parsers[name]
+            self.calls.append(("unreg_parser", name, owner))
+
+    def unregister_presenters(self, owner):
+        """Remove the stored presenters of the owner."""
+        for key in [k for k, o in self.presenters.items() if o == owner]:
+            del self.presenters[key]
+            self.calls.append(("unreg_presenter", key, owner))
+
+    def unregister_rules(self, owner):
+        """Remove the stored rules of the owner."""
+        while owner in self.rules:
+            self.rules.remove(owner)
+            self.calls.append(("unreg_rule", owner))
 
 
 class FakeService:
@@ -98,6 +163,42 @@ def setup(api):
         return ["a", "bad", "b"]
 
     api.register_poller("src_" + api.id, fetch, interval_seconds=0.01, timeout_seconds=0.05)
+"""
+
+
+IDENTITY_EXT = """
+import types
+
+def setup(api):
+    entry = type("E", (), dict(
+        source_id="src_" + api.id, config_group="extensions",
+        provider_family="extension"))()
+    api.register_source(entry)
+    sid = "src_" + api.id
+
+    def env(event_id, published_at, source_id=None):
+        ident = types.SimpleNamespace(
+            event_id=event_id, source_id=source_id or sid,
+            event_type="weather_alarm", provider_family="extension",
+            source_enum=sid, published_at=published_at, report_num=None,
+            unique_key=f"{source_id or sid}|weather_alarm|{event_id}",
+        )
+        return types.SimpleNamespace(identity=ident, source_id=source_id or sid)
+
+    async def fetch(session):
+        mode = api.config.get("mode")
+        if mode == "snapshot":
+            return [env("same", 1), env("same", 1), env("other", 1)]
+        if mode == "update":
+            api.config["n"] = api.config.get("n", 0) + 1
+            return [env("same", api.config["n"])]
+        if mode == "foreign":
+            return [env("x", 1, source_id="cenc_eew")]
+        if mode == "stuck":
+            return [env("stuck", 1), env("ok", 1)]
+        return []
+
+    api.register_poller(sid, fetch, interval_seconds=0.01, timeout_seconds=0.05)
 """
 
 
@@ -149,6 +250,8 @@ def _fast_poll(monkeypatch):
         ({"api_version": None}, "api_version"),
         ({"entry": "nocolon"}, "entry"),
         ({"permissions": "network"}, "permissions"),
+        ({"dependencies": "dep"}, "dependencies"),
+        ({"dependencies": ["Bad-Dep"]}, "dependencies"),
     ],
 )
 def test_manifest_errors(tmp_path, patch, msg):
@@ -158,6 +261,20 @@ def test_manifest_errors(tmp_path, patch, msg):
     data.update(patch)
     (d / "extension.yaml").write_text(json.dumps(data))
     with pytest.raises(manifest_mod.ManifestError, match=msg):
+        manifest_mod.load_manifest(d)
+
+
+def test_manifest_dependencies(tmp_path):
+    """Check the dependencies field: a valid list passes."""
+    d = make_ext(tmp_path, "good", dependencies=["other", "more"])
+    m = manifest_mod.load_manifest(d)
+    assert m.dependencies == ("other", "more")
+    # No dependencies field gives an empty tuple.
+    m = manifest_mod.load_manifest(make_ext(tmp_path, "second"))
+    assert m.dependencies == ()
+    # A self-reference is a cycle of length one: reject it here too.
+    d = make_ext(tmp_path, "self", dependencies=["self"])
+    with pytest.raises(manifest_mod.ManifestError, match="自身"):
         manifest_mod.load_manifest(d)
 
 
@@ -323,6 +440,148 @@ def test_incompatible_host_version(tmp_path):
     mgr = make_manager(tmp_path, FakeService(["new"]))
     mgr.load_all()
     assert mgr.status()[0]["state"] == "error"
+
+
+def test_path_traversal_id_does_not_load(tmp_path):
+    """Check that an enabled id with a path traversal loads nothing outside the roots."""
+    outside = tmp_path / "outside"
+    make_ext(outside, "evil")
+    mgr = make_manager(
+        tmp_path, FakeService(["../outside/evil"]), roots=[tmp_path / "bundled"]
+    )
+    mgr.load_all()
+    rows = {r["id"]: r["state"] for r in mgr.status()}
+    assert rows["../outside/evil"] == "error"
+    assert (
+        "非法" in next(r for r in mgr.status() if r["id"] == "../outside/evil")["error"]
+    )
+    assert "_dw_ext_evil" not in sys.modules
+
+
+def test_bad_extensions_config_does_not_abort(tmp_path):
+    """Check that extensions settings that are not a mapping do not stop the load."""
+    make_ext(tmp_path / "bundled", "good")
+    for bad in ("text", 42):
+        svc = FakeService(["good"])
+        svc.config = {"extensions": bad}
+        mgr = make_manager(tmp_path, svc)
+        mgr.load_all()  # No raise: the host starts without extensions.
+        rows = {r["id"]: r["state"] for r in mgr.status()}
+        assert rows == {"good": "disabled"}
+
+
+def test_enabled_ids_string_is_one_id(tmp_path):
+    """Check that a string in enabled_ids is one id, not one character per id."""
+    make_ext(tmp_path / "bundled", "good")
+    mgr = make_manager(tmp_path, FakeService("good"))
+    mgr.load_all()
+    assert mgr.status()[0]["state"] == "loaded"
+
+
+def test_enabled_ids_bad_type_is_ignored(tmp_path):
+    """Check that enabled_ids that is not a list or a string is ignored."""
+    make_ext(tmp_path / "bundled", "good")
+    svc = FakeService(["good"])
+    svc.config = {"extensions": {"enabled_ids": 123}}
+    mgr = make_manager(tmp_path, svc)
+    mgr.load_all()
+    rows = {r["id"]: r["state"] for r in mgr.status()}
+    assert rows == {"good": "disabled"}
+
+
+def test_unreadable_root_does_not_abort(tmp_path):
+    """Check that a root directory that the host cannot read does not stop the load."""
+    root = tmp_path / "bundled"
+    make_ext(root, "good")
+    root.chmod(0)
+    try:
+        mgr = make_manager(tmp_path, FakeService(["good"]), roots=[root])
+        mgr.load_all()  # No raise: the discovery failure of the root is isolated.
+        rows = {r["id"]: r["state"] for r in mgr.status()}
+        assert rows == {"good": "not_found"}  # seen, but not readable: not an abort
+    finally:
+        root.chmod(0o755)
+
+
+def test_broken_parser_reference_isolates_the_extension(tmp_path):
+    """Check that a source with an unregistered parser_name isolates only that extension."""
+    code = """
+def setup(api):
+    entry = type("E", (), dict(
+        source_id="src_" + api.id, config_group="extensions",
+        provider_family="extension"))()
+    api.register_source(entry)
+"""
+    root = tmp_path / "bundled"
+    make_ext(root, "badparser", code)
+    make_ext(root, "good")
+
+    class Registry(StatefulRegistry):
+        def missing_source_parser_names(self, owner: str) -> dict:
+            if owner == "badparser":
+                return {"src_badparser": "ghost_parser"}
+            return {}
+
+    reg = Registry()
+    mgr = make_manager(tmp_path, FakeService(["badparser", "good"]), reg)
+    mgr.load_all()
+    states = {r["id"]: r for r in mgr.status()}
+    assert states["badparser"]["state"] == "error"
+    assert "ghost_parser" in states["badparser"]["error"]
+    # The rollback removed the registration of the broken extension only.
+    assert reg.sources == {"src_good": "good"}
+    assert states["good"]["state"] == "loaded"
+
+
+def test_dependency_loads_first(tmp_path):
+    """Check that an extension loads after its dependencies, whatever the order."""
+    root = tmp_path / "bundled"
+    make_ext(root, "dep", "def setup(api):\n    pass\n")
+    make_ext(root, "top", "def setup(api):\n    pass\n", dependencies=["dep"])
+    mgr = make_manager(tmp_path, FakeService(["top", "dep"]))
+    mgr.load_all()
+    assert {r["id"]: r["state"] for r in mgr.status()} == {
+        "top": "loaded",
+        "dep": "loaded",
+    }
+    # The dependency loaded first, even though `top` is first in enabled_ids.
+    assert list(mgr._apis) == ["dep", "top"]
+
+
+def test_missing_dependency_is_an_error(tmp_path):
+    """Check that an extension whose dependency is not enabled gets the error state."""
+    root = tmp_path / "bundled"
+    make_ext(root, "top", "def setup(api):\n    pass\n", dependencies=["ghost"])
+    mgr = make_manager(tmp_path, FakeService(["top"]))
+    mgr.load_all()
+    (row,) = mgr.status()
+    assert row["state"] == "error" and "ghost" in row["error"]
+    assert not mgr._apis
+
+
+def test_broken_dependency_blocks_the_dependent(tmp_path):
+    """Check that an extension whose dependency fails to load does not load either."""
+    root = tmp_path / "bundled"
+    make_ext(root, "broken", "def setup(api):\n    raise RuntimeError('nope')\n")
+    make_ext(root, "top", "def setup(api):\n    pass\n", dependencies=["broken"])
+    mgr = make_manager(tmp_path, FakeService(["top", "broken"]))
+    mgr.load_all()
+    states = {r["id"]: r["state"] for r in mgr.status()}
+    assert states["broken"] == "error"
+    assert states["top"] == "error"
+    assert mgr._apis == {}
+
+
+def test_dependency_cycle_is_an_error(tmp_path):
+    """Check that a dependency cycle puts every member in the error state."""
+    root = tmp_path / "bundled"
+    make_ext(root, "aa", "def setup(api):\n    pass\n", dependencies=["bb"])
+    make_ext(root, "bb", "def setup(api):\n    pass\n", dependencies=["aa"])
+    mgr = make_manager(tmp_path, FakeService(["aa", "bb"]))
+    mgr.load_all()
+    states = {r["id"]: r["state"] for r in mgr.status()}
+    assert states == {"aa": "error", "bb": "error"}
+    assert not mgr._apis
 
 
 def test_poller_requires_network_permission(tmp_path):
@@ -512,10 +771,242 @@ async def test_handled_event_is_not_given_again(tmp_path):
 async def test_stop_removes_the_registrations(tmp_path):
     """Check that a stopped extension leaves no registration in the shared host."""
     make_ext(tmp_path / "bundled", "good")
-    reg = FakeRegistry()
+    reg = StatefulRegistry()
     mgr = make_manager(tmp_path, FakeService(["good"]), reg)
     mgr.load_all()
+    assert reg.sources == {"src_good": "good"}  # the registration is there
     reg.calls.clear()
     await mgr.stop()
-    assert any(call[0].startswith("unreg") for call in reg.calls)
+    # The unregister methods removed the registrations: nothing is left.
+    assert reg.sources == {}
+    assert reg.parsers == {} and reg.presenters == {} and reg.rules == []
     assert mgr.status()[0]["state"] == "loaded"
+
+
+async def test_the_poll_loop_retries_a_failed_event(tmp_path):
+    """Check that the poll loop keeps a failed envelope and retries it at the next poll.
+
+    The fetch returns the envelope one time only. The host refuses it the
+    first time. Only a retry of the poll loop can deliver it.
+    """
+    code = """
+def setup(api):
+    entry = type("E", (), dict(
+        source_id="src_" + api.id, config_group="extensions",
+        provider_family="extension"))()
+    api.register_source(entry)
+    served = [False]
+
+    async def fetch(session):
+        if served[0]:
+            return []
+        served[0] = True
+        return ["once"]
+
+    api.register_poller("src_" + api.id, fetch, interval_seconds=0.01, timeout_seconds=0.05)
+"""
+    make_ext(tmp_path / "bundled", "retry", code)
+
+    class Service(FakeService):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            self.first = True
+
+        async def _handle_disaster_event(self, env):
+            if env == "once" and self.first:
+                self.first = False
+                return False
+            self.events.append(env)
+            return True
+
+    svc = Service(["retry"])
+    mgr = make_manager(tmp_path, svc)
+    mgr.load_all()
+    await mgr.start()
+    try:
+        await _wait_for(lambda: "once" in svc.events)
+    finally:
+        await mgr.stop()
+    assert svc.events == ["once"]
+
+
+async def test_restart_restores_the_extensions(tmp_path):
+    """Check that a start() after a stop() of the same manager loads the extensions again."""
+    make_ext(tmp_path / "bundled", "good")
+    reg = StatefulRegistry()
+    mgr = make_manager(tmp_path, FakeService(["good"]), reg)
+    mgr.load_all()
+    await mgr.start()
+    await mgr.stop()
+    assert not mgr._apis and reg.sources == {}
+    await mgr.start()
+    try:
+        assert list(mgr._apis) == ["good"]  # the extensions load again
+        assert reg.sources == {"src_good": "good"}  # the registrations are back
+        assert mgr.status()[0]["state"] == "loaded"
+    finally:
+        await mgr.stop()
+
+
+async def test_pending_survives_a_stop(tmp_path):
+    """Check that a failed envelope that stop() interrupts is delivered after the restart."""
+    code = """
+def setup(api):
+    entry = type("E", (), dict(
+        source_id="src_" + api.id, config_group="extensions",
+        provider_family="extension"))()
+    api.register_source(entry)
+    served = [False]
+
+    async def fetch(session):
+        if served[0]:
+            return []
+        served[0] = True
+        return ["once"]
+
+    api.register_poller("src_" + api.id, fetch, interval_seconds=0.01, timeout_seconds=0.05)
+"""
+    make_ext(tmp_path / "bundled", "hold", code)
+
+    class Service(FakeService):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            self.succeed = False
+
+        async def _handle_disaster_event(self, env):
+            if not self.succeed:
+                return False
+            self.events.append(env)
+            return True
+
+    svc = Service(["hold"])
+    mgr = make_manager(tmp_path, svc)
+    mgr.load_all()
+    await mgr.start()
+    # The envelope failed: it waits in pending for the next poll.
+    await _wait_for(lambda: any(p for p in mgr._pending.values()))
+    await mgr.stop()  # cancelled between polls: the envelope stays in pending
+    svc.succeed = True
+    await mgr.start()  # the poller continues with the pending envelope
+    try:
+        await _wait_for(lambda: "once" in svc.events)
+    finally:
+        await mgr.stop()
+
+
+async def test_unchanged_event_is_not_sent_twice(tmp_path):
+    """Check that an unchanged event snapshot is not delivered on every poll."""
+    make_ext(tmp_path / "bundled", "dedup", IDENTITY_EXT)
+    svc = FakeService(["dedup"], {"dedup": {"mode": "snapshot"}})
+    mgr = make_manager(tmp_path, svc)
+    mgr.load_all()
+    await mgr.start()
+    try:
+        # The fetch returns [same, same, other] on every poll.
+        await _wait_for(lambda: len(svc.events) >= 2)
+        first = list(svc.events)
+        await asyncio.sleep(0.1)  # a few more cycles
+        assert svc.events == first  # nothing new: the host skips the seen identities
+        assert len(svc.events) == 2  # `same` once (not twice), plus `other`
+    finally:
+        await mgr.stop()
+
+
+async def test_an_update_with_a_new_published_at_is_sent(tmp_path):
+    """Check that the same event_id with a new published_at is an update: the host sends it."""
+    make_ext(tmp_path / "bundled", "upd", IDENTITY_EXT)
+    svc = FakeService(["upd"], {"upd": {"mode": "update"}})
+    mgr = make_manager(tmp_path, svc)
+    mgr.load_all()
+    await mgr.start()
+    try:
+        await _wait_for(lambda: len(svc.events) >= 2)
+        ids = [env.identity.event_id for env in svc.events]
+        assert ids == ["same", "same"]  # every fetch is an update, not a duplicate
+    finally:
+        await mgr.stop()
+
+
+async def test_poller_cannot_speak_for_another_source(tmp_path):
+    """Check that an envelope whose source_id is not the source of the poller is rejected."""
+    make_ext(tmp_path / "bundled", "foreign", IDENTITY_EXT)
+    svc = FakeService(["foreign"], {"foreign": {"mode": "foreign"}})
+    mgr = make_manager(tmp_path, svc)
+    mgr.load_all()
+    await mgr.start()
+    try:
+        await asyncio.sleep(0.2)  # several cycles
+        assert svc.events == []
+        assert not any(p for p in mgr._pending.values())  # rejected, not pending
+    finally:
+        await mgr.stop()
+
+
+async def test_a_stalled_handler_does_not_stop_the_poller(tmp_path, monkeypatch):
+    """Check that a delivery that the host never finishes returns to pending."""
+    monkeypatch.setattr(manager_mod.ExtensionManager, "DELIVERY_TIMEOUT_SECONDS", 0.05)
+    make_ext(tmp_path / "bundled", "stuck", IDENTITY_EXT)
+
+    class Service(FakeService):
+        async def _handle_disaster_event(self, env):
+            if getattr(getattr(env, "identity", None), "event_id", None) == "stuck":
+                await asyncio.sleep(3600)  # the handler never finishes
+            self.events.append(env)
+            return True
+
+    svc = Service(["stuck"], {"stuck": {"mode": "stuck"}})
+    mgr = make_manager(tmp_path, svc)
+    mgr.load_all()
+    await mgr.start()
+    try:
+        await _wait_for(lambda: len(svc.events) >= 1)  # "ok" arrives
+        (task,) = mgr._tasks
+        assert not task.done()  # the poller keeps polling
+        # The stalled envelope waits in pending for the next poll.
+        assert any(
+            getattr(getattr(e, "identity", None), "event_id", None) == "stuck"
+            for p in mgr._pending.values()
+            for e in p
+        )
+    finally:
+        await mgr.stop()
+
+
+async def test_pending_overflow_logs_the_dropped_count(tmp_path):
+    """Check the overflow policy: the newest 100 stay, and the count is said."""
+    code = """
+def setup(api):
+    entry = type("E", (), dict(
+        source_id="src_" + api.id, config_group="extensions",
+        provider_family="extension"))()
+    api.register_source(entry)
+    served = [False]
+
+    async def fetch(session):
+        if served[0]:
+            return []
+        served[0] = True
+        return [f"env_{i}" for i in range(105)]
+
+    api.register_poller("src_" + api.id, fetch, interval_seconds=0.01, timeout_seconds=0.05)
+"""
+    make_ext(tmp_path / "bundled", "flood", code)
+
+    class Service(FakeService):
+        async def _handle_disaster_event(self, env):
+            return False  # the host refuses every envelope
+
+    svc = Service(["flood"])
+    mgr = make_manager(tmp_path, svc)
+    mgr.load_all()
+    await mgr.start()
+    try:
+        cap = mgr.MAX_PENDING_ENVELOPES
+        # One poll returns 105 envelopes. All fail: pending keeps the newest 100.
+        await _wait_for(
+            lambda: any(len(p) == cap for p in mgr._pending.values()), timeout=5.0
+        )
+        (task,) = mgr._tasks
+        assert not task.done()  # the poller keeps polling
+    finally:
+        await mgr.stop()

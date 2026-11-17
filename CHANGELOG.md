@@ -14,6 +14,24 @@
 
 - Add the extension system. An extension adds data sources, presenters and rules without a fork. Extensions are off by default. The API is in `docs/extensions/design.md` by @h0ffmann
 - Add the admin command `/灾害预警扩展`. It shows the load state, the sources and the error of each extension. It also shows the extensions on disk that are not enabled by @h0ffmann
+- Extensions can name `dependencies` in `extension.yaml`. The host loads them first; a missing, failed or cyclic dependency sets the error state and isolates the extension by @h0ffmann
+
+### 🐛 Fixes (修复)
+
+- Harden the extension manager against bad configuration: a non-mapping `extensions` value or a bad `enabled_ids` no longer stops the host, a string is one id, and an id with a path traversal loads nothing by @h0ffmann
+- An unreadable extension root directory no longer aborts the plugin. The host logs the failure and continues with the other roots by @h0ffmann
+- A source that references an `extension.yaml` parser_name the extension did not register no longer stops the host from starting. The extension alone gets the error state by @h0ffmann
+- Extension rules that share an anchor now run in their registration order, and a rule that raises is isolated: it cannot block the push of events from other sources by @h0ffmann
+- The host drains the weather aggregation buffer before it unregisters the extension sources and presenters at stop, so buffered extension events keep their presentation by @h0ffmann
+- A restart of the same service loads the extensions again: their sources and pollers come back, and failed envelopes that stop() interrupted are delivered after the restart by @h0ffmann
+- Extension weather events use the enum member or the string value of `provider_family`, so an extension presenter receives `WeatherEvent.metadata` in the display context in both cases by @h0ffmann
+
+### 🛡️ Reliability (可靠性)
+
+- The pollers deliver only new or changed events: the host keeps the identities that a poller already delivered and skips an unchanged alert snapshot; an update with a new `published_at` passes by @h0ffmann
+- A delivery that the host does not finish within one minute returns to the poller and is retried at the next poll: a stalled handler does not stop the collection of alerts by @h0ffmann
+- An envelope whose `source_id` is not the source of its polling task is rejected: an extension cannot speak for another source by @h0ffmann
+- More than 100 failed envelopes in one polling cycle keep the newest and log the count that was dropped: no silent discard by @h0ffmann
 
 ### 🌐 Data Sources & Network (数据源与网络)
 
@@ -27,6 +45,7 @@
 ### 📚 Documentation (文档)
 
 - Add the extension guide in `docs/extensions/` and the extension entries to the README by @h0ffmann
+- Write the poller contract: what a poller returns, when the host skips an event, and how updates pass by @h0ffmann
 
 ### 🔧 Chore (杂项)
 

@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+from astrbot.api import logger
+
 from .base_rule import RuleContext
 from .intensity_rule import EarthquakeThresholdRule
 from .keyword_rule import KeywordRule
@@ -69,6 +71,30 @@ _REGISTERED_RULES: list[tuple[object, str, str]] = []
 _build_builtin_rule_chain = build_default_rule_chain
 
 
+class _IsolatedRule:
+    """规则链里的一条扩展规则。
+
+    扩展规则自身求值抛出异常时不再中断整条规则链：一个坏的扩展规则
+    不能拦下其他数据源的事件。异常记录为警告，规则按放行处理。
+    """
+
+    def __init__(self, rule):
+        self._rule = rule
+        # The wrapper keeps the rule_name of the rule. The chain uses the name
+        # to find the anchor rule, and another extension can anchor after it.
+        self.rule_name = str(getattr(rule, "rule_name", "") or "")
+
+    def evaluate(self, context: RuleContext) -> RuleDecision:
+        """Run the rule. An exception of the rule is isolated."""
+        try:
+            return self._rule.evaluate(context)
+        except Exception as e:
+            logger.warning(
+                f"[灾害预警] 扩展规则 {self.rule_name!r} 求值异常，已放行: {type(e).__name__}: {e}"
+            )
+            return RuleDecision.accept(reason="扩展规则异常，已放行")
+
+
 def register_rule(rule, *, after: str = "local_rule", owner: str) -> None:
     """Register an extension rule after the built-in rule with the name `after`.
 
@@ -83,10 +109,18 @@ def unregister_rules(owner: str) -> None:
 
 
 def build_default_rule_chain() -> RuleChain:  # noqa: F811
-    """Build the built-in rule chain, then insert the extension rules."""
+    """Build the built-in rule chain, then insert the extension rules.
+
+    扩展规则按注册顺序插入其锚点之后：同一锚点的多条规则，先注册的先执行，
+    后注册的排在它后面（而不是排在它前面）。
+    """
     chain = _build_builtin_rule_chain()
+    # Group the rules by anchor. The group keeps the registration order.
+    groups: dict[str, list] = {}
     for rule, after, _owner in _REGISTERED_RULES:
+        groups.setdefault(after, []).append(_IsolatedRule(rule))
+    for anchor, rules in groups.items():
         names = [getattr(item, "rule_name", "") for item in chain.rules]
-        index = names.index(after) + 1 if after in names else len(chain.rules)
-        chain.rules.insert(index, rule)
+        index = names.index(anchor) + 1 if anchor in names else len(chain.rules)
+        chain.rules[index:index] = rules
     return chain

@@ -8,6 +8,7 @@ from .base_parser import BaseParser
 from .fssn_cmt_parser import FssnCmtParser
 from .parser_registry import (
     create_parser_for_source,
+    missing_catalog_parser_names,
     resolve_parser_class,
     validate_catalog_parser_names,
 )
@@ -16,6 +17,7 @@ __all__ = [
     "BaseParser",
     "FssnCmtParser",
     "create_parser_for_source",
+    "missing_catalog_parser_names",
     "resolve_parser_class",
     "validate_catalog_parser_names",
 ]
