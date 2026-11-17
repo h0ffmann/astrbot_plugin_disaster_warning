@@ -92,6 +92,10 @@ class ExtensionManager:
         self._tasks: list[asyncio.Task] = []
         self._session: aiohttp.ClientSession | None = None
         self._loaded_once = False  # A start() after a stop() loads again
+        # Serializes start() and stop(). The service locks of the host
+        # (_start_lock, _stop_lock) do not exclude each other, so the manager
+        # guards its own session, pollers and registrations with this one.
+        self._lifecycle_lock = asyncio.Lock()
         # State of the polling tasks. It survives a stop(): the pollers of a
         # restart continue where they stopped.
         self._pending: dict[str, list] = {}  # label -> failed envelopes
@@ -253,7 +257,7 @@ class ExtensionManager:
                 continue
             self._load_one(ext_id, found[ext_id], settings.get(ext_id))
         self._record_disabled(set(enabled))
-        self._drop_stale_poll_state()
+        self._drop_stale_poll_state(enabled)
 
     def _plan_load_order(
         self, found: dict[str, Path]
@@ -367,16 +371,21 @@ class ExtensionManager:
                     ext_id, "disabled", name=manifest.name, version=manifest.version
                 )
 
-    def _drop_stale_poll_state(self) -> None:
-        """Drop the poll state of extensions that no longer load."""
-        labels = {
-            f"{ext_id}/{spec.source_id}"
-            for ext_id, api in self._apis.items()
-            for spec in api.pollers
-        }
-        for label in [key for key in self._pending if key not in labels]:
+    def _drop_stale_poll_state(self, enabled: list[str]) -> None:
+        """Drop the poll state of extensions that are no longer enabled.
+
+        An extension that stays enabled keeps its state even when its load
+        fails: its pollers resume with the pending envelopes when it loads
+        again in a later restart.
+        """
+        enabled_ids = set(enabled)
+        for label in [
+            key for key in self._pending if key.split("/", 1)[0] not in enabled_ids
+        ]:
             del self._pending[label]
-        for label in [key for key in self._seen if key not in labels]:
+        for label in [
+            key for key in self._seen if key.split("/", 1)[0] not in enabled_ids
+        ]:
             del self._seen[label]
 
     @staticmethod
@@ -448,25 +457,30 @@ class ExtensionManager:
         After a stop() on the same manager, the extensions are no longer
         loaded. Load them again, so a restart of the service restores the
         sources, the pollers and the envelopes that still wait.
+
+        The lock of the manager serializes start() and stop(): the service
+        locks of the host (_start_lock, _stop_lock) do not exclude each
+        other, so a start that runs while a stop is in flight waits for it.
         """
-        if self._loaded_once and not self._apis and not self._tasks:
-            self.load_all()
-        specs = [(i, p) for i, api in self._apis.items() for p in api.pollers]
-        if not specs or self._tasks:
-            return
-        self._session = aiohttp.ClientSession(
-            connector=aiohttp.TCPConnector(ssl=_build_ssl_context())
-        )
-        for ext_id, spec in specs:
-            label = f"{ext_id}/{spec.source_id}"
-            self._pending.setdefault(label, [])
-            self._seen.setdefault(label, {})
-            self._tasks.append(
-                asyncio.create_task(
-                    self._run_poller(ext_id, spec),
-                    name=f"ext-poller-{ext_id}-{spec.source_id}",
-                )
+        async with self._lifecycle_lock:
+            if self._loaded_once and not self._apis and not self._tasks:
+                self.load_all()
+            specs = [(i, p) for i, api in self._apis.items() for p in api.pollers]
+            if not specs or self._tasks:
+                return
+            self._session = aiohttp.ClientSession(
+                connector=aiohttp.TCPConnector(ssl=_build_ssl_context())
             )
+            for ext_id, spec in specs:
+                label = f"{ext_id}/{spec.source_id}"
+                self._pending.setdefault(label, [])
+                self._seen.setdefault(label, {})
+                self._tasks.append(
+                    asyncio.create_task(
+                        self._run_poller(ext_id, spec),
+                        name=f"ext-poller-{ext_id}-{spec.source_id}",
+                    )
+                )
 
     async def stop(self) -> None:
         """Cancel the polling tasks, close the session and remove the registrations.
@@ -477,31 +491,35 @@ class ExtensionManager:
         stay in the manager: a start() of this manager (a service restart)
         continues where the pollers stopped.
         """
-        tasks, self._tasks = self._tasks, []
-        for t in tasks:
-            t.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
-        if self._session is not None:
-            await self._session.close()
-            self._session = None
-        for ext_id in list(self._apis):
-            self._unregister_all(ext_id)
-        self._apis.clear()
+        async with self._lifecycle_lock:
+            tasks, self._tasks = self._tasks, []
+            for t in tasks:
+                t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            if self._session is not None:
+                await self._session.close()
+                self._session = None
+            for ext_id in list(self._apis):
+                self._unregister_all(ext_id)
+            self._apis.clear()
 
     async def _run_poller(self, ext_id: str, spec: PollerSpec) -> None:
         """Poll in a loop. Log each exception except CancelledError, then retry with backoff.
 
-        An extension marks an event as sent before the host handles it. Thus, a failed
-        event stays in pending, and the next poll gives it to the host again.
-        An envelope whose identity the host already delivered is not delivered
-        again: an extension that returns the current alert snapshot does not
-        push an unchanged alert twice. The pending list and the delivered
-        identities live in the manager: they survive a stop() and a restart.
+        An envelope that the host did not handle stays in the pending list,
+        and the next poll gives it to the host again. An envelope whose
+        identity the host already delivered is not delivered again: an
+        extension that returns the current alert snapshot does not push an
+        unchanged alert twice. The pending list and the delivered identities
+        live in the manager: they survive a stop() and the restart of the
+        pollers.
         """
         failures = 0
         last_log = float("-inf")
         label = f"{ext_id}/{spec.source_id}"
         seen = self._seen.setdefault(label, {})
+        # `pending` is the list object in self._pending: _deliver() changes
+        # the list in place, so every change is at once visible to a restart.
         pending = self._pending.setdefault(label, [])
 
         def log_throttled(msg: str) -> None:
@@ -514,23 +532,26 @@ class ExtensionManager:
         while True:
             try:
                 if pending:
-                    pending = await self._deliver(
+                    # Retry the envelopes that the host refused. A retry that
+                    # the host handles leaves the list inside _deliver().
+                    await self._deliver(
                         pending, log_throttled, source_id=spec.source_id
                     )
-                    self._pending[label] = pending
-                envelopes = [
-                    env
-                    for env in (
-                        await asyncio.wait_for(
-                            spec.fetch(self._session), timeout=spec.timeout_seconds
-                        )
-                        or []
+                fetched = (
+                    await asyncio.wait_for(
+                        spec.fetch(self._session), timeout=spec.timeout_seconds
                     )
-                    if self._mark_seen(seen, env)
-                ]
-                pending += await self._deliver(
-                    envelopes, log_throttled, source_id=spec.source_id
+                    or []
                 )
+                fresh = [env for env in fetched if self._mark_seen(seen, env)]
+                if fresh:
+                    # The fresh envelopes join the recoverable list before
+                    # the first delivery: a stop during the delivery keeps
+                    # every envelope that did not finish.
+                    pending += fresh
+                    await self._deliver(
+                        pending, log_throttled, source_id=spec.source_id
+                    )
                 if len(pending) > self.MAX_PENDING_ENVELOPES:
                     # Too many failed events in one cycle: keep the newest
                     # and say what was dropped. The host does not drop them in silence.
@@ -539,10 +560,11 @@ class ExtensionManager:
                         f"待重试事件超过 {self.MAX_PENDING_ENVELOPES} 个，丢弃最早的 {dropped} 个"
                     )
                     pending = pending[-self.MAX_PENDING_ENVELOPES :]
-                self._pending[label] = pending
+                    self._pending[label] = pending
                 failures = 0
             except asyncio.CancelledError:
-                self._pending[label] = pending
+                # `pending` is the list object in self._pending (the only
+                # exception is the truncation above, which syncs at once).
                 raise
             except Exception as e:
                 failures += 1
@@ -551,9 +573,12 @@ class ExtensionManager:
             await asyncio.sleep(spec.interval_seconds * factor)
 
     def _mark_seen(self, seen: dict[str, None], envelope: Any) -> bool:
-        """Mark the identity of an envelope as delivered. Return False when the host already delivered it.
+        """Mark the identity of an envelope as seen. Return False when the host already delivered it.
 
-        An envelope without an identity takes no part in the deduplication.
+        The host marks the identity at the fetch: an envelope that stays in
+        pending is still delivered by the retry, so an interrupted delivery
+        loses nothing. An envelope without an identity takes no part in the
+        deduplication.
         """
         key = _dedupe_key(envelope)
         if key is None:
@@ -566,19 +591,25 @@ class ExtensionManager:
         return True
 
     async def _deliver(
-        self, envelopes: list, log_throttled, *, source_id: str = ""
-    ) -> list:
-        """Give each envelope to the host. Return the envelopes that failed.
+        self, batch: list, log_throttled, *, source_id: str = ""
+    ) -> None:
+        """Give each envelope of the batch to the host, and change the batch in place.
+
+        An envelope leaves the batch when the host handles it. A delivery
+        that the host refuses, that times out, or that raises keeps the
+        envelope in the batch: the next poll gives it to the host again. A
+        cancellation between two envelopes keeps every envelope that did not
+        finish, so the pending list of the polling task loses nothing.
 
         An envelope whose source_id does not match the source of the polling
         task is rejected: an extension must not speak for another source.
-        A delivery that the host does not finish within the delivery timeout
-        returns as failed: a stalled handler does not stop the poller.
         """
-        failed = []
-        for env in envelopes:
+        index = 0
+        while index < len(batch):
+            env = batch[index]
             env_source = getattr(env, "source_id", None)
             if env_source is not None and source_id and env_source != source_id:
+                batch.pop(index)
                 log_throttled(f"拒绝信封：source_id 不属于本轮询的源: {env_source!r}")
                 continue
             try:
@@ -587,17 +618,21 @@ class ExtensionManager:
                     timeout=self.DELIVERY_TIMEOUT_SECONDS,
                 )
                 if handled is False:
-                    failed.append(env)
+                    index += 1
                     log_throttled("处理事件失败，下次轮询重试")
+                    continue
             except asyncio.TimeoutError:
-                failed.append(env)
+                index += 1
                 log_throttled(
                     f"事件处理超时（>{self.DELIVERY_TIMEOUT_SECONDS}s），下次轮询重试"
                 )
+                continue
             except Exception as e:
-                failed.append(env)
+                index += 1
                 log_throttled(f"处理事件失败: {type(e).__name__}: {e}")
-        return failed
+                continue
+            # The host handled the envelope: it leaves the batch.
+            batch.pop(index)
 
     def status(self) -> list[dict]:
         """Return the load state of each extension for the admin command."""

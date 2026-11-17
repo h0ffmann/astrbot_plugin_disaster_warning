@@ -85,9 +85,15 @@ class _IsolatedRule:
         self.rule_name = str(getattr(rule, "rule_name", "") or "")
 
     def evaluate(self, context: RuleContext) -> RuleDecision:
-        """Run the rule. An exception of the rule is isolated."""
+        """Run the rule. An exception, or a return value that is not a
+        RuleDecision, is isolated: the chain continues."""
         try:
-            return self._rule.evaluate(context)
+            decision = self._rule.evaluate(context)
+            if not isinstance(decision, RuleDecision):
+                raise TypeError(
+                    f"规则返回了 {type(decision).__name__}，需要 RuleDecision"
+                )
+            return decision
         except Exception as e:
             logger.warning(
                 f"[灾害预警] 扩展规则 {self.rule_name!r} 求值异常，已放行: {type(e).__name__}: {e}"

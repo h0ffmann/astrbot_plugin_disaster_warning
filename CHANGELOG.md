@@ -32,6 +32,10 @@
 - A delivery that the host does not finish within one minute returns to the poller and is retried at the next poll: a stalled handler does not stop the collection of alerts by @h0ffmann
 - An envelope whose `source_id` is not the source of its polling task is rejected: an extension cannot speak for another source by @h0ffmann
 - More than 100 failed envelopes in one polling cycle keep the newest and log the count that was dropped: no silent discard by @h0ffmann
+- `start()` and `stop()` of the manager are serialized with one lock: the service locks of the host do not exclude each other, so a stop and a concurrent start can no longer leave a closed session behind or leak polling tasks by @h0ffmann
+- A stop between two envelopes of a delivery keeps every envelope that did not finish: the pending list of the poller loses nothing, and a restart delivers what was interrupted by @h0ffmann
+- An extension that stays enabled keeps its pending envelopes and delivered identities across a load that fails: its pollers resume with them when it loads again by @h0ffmann
+- Extension rules isolate a rule that returns an invalid value as well as a rule that raises: one broken rule cannot block the events of the other sources by @h0ffmann
 
 ### 🌐 Data Sources & Network (数据源与网络)
 

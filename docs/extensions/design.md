@@ -171,27 +171,39 @@ class ExtensionAPI:
   - It calls each `unregister_*(owner=id)` function.
   - It writes a warning to the log.
   - It continues with the next extension.
-- The lifecycle start calls `start()`. The manager starts one asyncio task for each poller:
+- The lifecycle start calls `start()`. The manager starts one asyncio task for each poller.
+  The manager serializes `start()` and `stop()` with one lock: the service locks of the
+  host (`_start_lock`, `_stop_lock`) do not exclude each other, so a start that runs
+  while a stop is in flight waits for it:
   - All pollers use one `aiohttp.ClientSession`. The session uses the certifi root certificates.
   - The manager calls `fetch` with `asyncio.wait_for(timeout_seconds)`.
   - The manager sends each envelope to `await service._handle_disaster_event(envelope)`.
     Each call has its own try/except and a delivery timeout of one minute: a handler that
-    stalls returns the envelope to the poller instead of stopping its collection.
+    stalls returns the envelope to the poller instead of stopping its collection. An
+    envelope leaves the pending list when the host handles it: a stop between two
+    envelopes keeps every envelope that did not finish, so the poller loses nothing.
   - An envelope whose `source_id` is not the source of the polling task is rejected. An
     extension cannot speak for another source, built-in or extension.
   - The host keeps the identity of every envelope that it delivered. An envelope with the
     same identity (`unique_key` plus `published_at`) is not delivered again: a poller that
     returns the current alert snapshot does not push an unchanged alert twice. An update
-    passes when the extension gives the same `event_id` a new `published_at`.
+    passes when the extension gives the same `event_id` a new `published_at`. One polling
+    task keeps the newest 1024 identities (`MAX_SEEN_EVENTS`): an identity older than
+    that is forgotten, and a poller that returns it again then delivers it again.
   - If an exception occurs, the manager writes a log message (not more than one in each period).
     Then it waits longer before the next attempt (exponential backoff). The maximum wait is 10 times the interval.
     A poller task does not stop because of an exception.
   - An envelope that the host did not handle stays in `pending` and goes to the host again
     at the next poll. The poller keeps at most 100 failed envelopes: when a cycle drops
     them, it logs the count, it does not discard them in silence.
-  - `pending` and the delivered identities live in the manager. They survive a `stop()`:
-    a `start()` of the same manager (a service restart) loads the extensions again, restarts
-    the pollers, and delivers the envelopes that stop() interrupted.
+  - `pending` and the delivered identities live in the memory of the manager. They survive
+    the `stop()` and the `start()` of the same manager (a service restart loads the
+    extensions again, restarts the pollers, and delivers the envelopes that `stop()`
+    interrupted), and the load of an extension that fails: an extension that stays
+    enabled keeps its state, and its pollers resume with it when it loads again. A
+    reload of the plugin and a new process make a new manager: they start with no
+    pending envelopes, and an extension that wants an event delivered after a reload
+    must send it again.
 - `stop()` cancels the poller tasks and closes the session. The lifecycle drains the weather
   aggregation buffer **before** `stop()` unregisters the extension sources and presenters:
   buffered extension events keep their extension presentation.

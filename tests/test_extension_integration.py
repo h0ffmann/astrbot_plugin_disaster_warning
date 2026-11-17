@@ -293,6 +293,41 @@ async def test_a_broken_extension_rule_does_not_block_events(two_loaded):
         rule_chain.unregister_rules(FIRST)
 
 
+async def test_a_rule_that_returns_nothing_is_isolated(two_loaded):
+    """A rule of an extension that returns None must not stop the chain.
+
+    RuleChain.evaluate reads decision.accepted: a rule that forgets the
+    return value would raise an AttributeError outside the isolation
+    boundary of the extension rule. The wrapper catches it too.
+    """
+    importlib.import_module("astrbot_plugin_disaster_warning.core.app.disaster_service")
+    from astrbot_plugin_disaster_warning.core.message.push.push_policy import (
+        evaluate_push_decision_with_components,
+    )
+
+    rule_chain = importlib.import_module(
+        "astrbot_plugin_disaster_warning.core.rules.rule_chain"
+    )
+
+    class NoneRule:
+        rule_name = "test_none_ext_rule"
+
+        def evaluate(self, context):
+            return None  # third-party code can forget the return value
+
+    rule_chain.register_rule(NoneRule(), owner=FIRST)
+    try:
+        envelope = await _first_event(two_loaded, SECOND)
+        runtime_config = {"weather_config": {"weather_filter": {"enabled": True}}}
+        decision = evaluate_push_decision_with_components(
+            envelope, runtime_config=runtime_config, policy_state={}
+        )
+        # The rule without a decision is isolated: the chain accepts.
+        assert decision.accepted, decision.reason
+    finally:
+        rule_chain.unregister_rules(FIRST)
+
+
 async def test_stop_flushes_the_weather_buffer_before_the_extensions():
     """Check the shutdown order: drain the aggregation buffer before unregistering.
 

@@ -114,7 +114,13 @@ Make the envelopes in the same way as [`envelopes.py`](https://github.com/h0ffma
   - A longer wait after each failure (exponential backoff).
   - Not more than one error log message in each period.
   - An event that the host did not handle goes to the host again at the next
-    poll. It survives a reload of the plugin and a restart of the service.
+    poll. Your poller keeps at most 100 such events: a poll with more
+    failures keeps the newest ones and logs the count that it dropped.
+  - Those events survive a stop and a start of the same service instance
+    (your pollers resume with them) and a load of your extension that fails
+    (it stays enabled, and its pollers resume when it loads again). A
+    reload of the plugin makes a new manager with no pending events: send
+    an event that you still want delivered.
 - Translation: `api.t(key, **fmt)` looks in `locale/<language>.json`, then in `locale/zh-CN.json`.
   If `api.t` does not find the key, it gives the key itself.
 
@@ -125,7 +131,9 @@ host keeps the identity (`unique_key` plus `published_at`) of every envelope
 that it delivered, and it does not deliver an unchanged envelope again:
 
 - An alert that you send again with the same identity and the same
-  `published_at` is skipped.
+  `published_at` is skipped. One poller remembers the newest 1024
+  identities: an identity older than that is forgotten, and the host
+  delivers its envelope again if you return it.
 - An update of the same alert passes when you give the same `event_id` a new
   `published_at` (for example the time of the last update of the alert).
 - An envelope whose `source_id` is not the source of your poller is rejected.

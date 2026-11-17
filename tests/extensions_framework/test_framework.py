@@ -166,6 +166,24 @@ def setup(api):
 """
 
 
+ONCE_EXT = """
+def setup(api):
+    entry = type("E", (), dict(
+        source_id="src_" + api.id, config_group="extensions",
+        provider_family="extension"))()
+    api.register_source(entry)
+    served = [False]
+
+    async def fetch(session):
+        if served[0]:
+            return []
+        served[0] = True
+        return ["once"]
+
+    api.register_poller("src_" + api.id, fetch, interval_seconds=0.01, timeout_seconds=0.05)
+"""
+
+
 IDENTITY_EXT = """
 import types
 
@@ -196,6 +214,11 @@ def setup(api):
             return [env("x", 1, source_id="cenc_eew")]
         if mode == "stuck":
             return [env("stuck", 1), env("ok", 1)]
+        if mode == "batch":
+            if not api.config.get("served"):
+                api.config["served"] = True
+                return [env("first", 1), env("second", 1)]
+            return []
         return []
 
     api.register_poller(sid, fetch, interval_seconds=0.01, timeout_seconds=0.05)
@@ -743,7 +766,7 @@ async def test_start_without_pollers_is_noop(tmp_path):
 
 @pytest.mark.parametrize("failure", ["false", "raises"])
 async def test_failed_event_is_given_to_the_host_again(tmp_path, failure):
-    """Check that an event that the host did not handle stays for the next poll."""
+    """Check that an event that the host did not handle stays in the batch."""
     make_ext(tmp_path / "bundled", "good")
 
     class Service(FakeService):
@@ -753,7 +776,9 @@ async def test_failed_event_is_given_to_the_host_again(tmp_path, failure):
             return False
 
     mgr = make_manager(tmp_path, Service(["good"]))
-    assert await mgr._deliver(["a", "b"], lambda _msg: None) == ["a", "b"]
+    batch = ["a", "b"]
+    await mgr._deliver(batch, lambda _msg: None)
+    assert batch == ["a", "b"]  # both stay: the next poll retries them
 
 
 async def test_handled_event_is_not_given_again(tmp_path):
@@ -765,7 +790,23 @@ async def test_handled_event_is_not_given_again(tmp_path):
             return next(results)
 
     mgr = make_manager(tmp_path, Service([]))
-    assert await mgr._deliver(["a", "b"], lambda _msg: None) == []
+    batch = ["a", "b"]
+    await mgr._deliver(batch, lambda _msg: None)
+    assert batch == []  # both mean handled: both leave the batch
+
+
+async def test_rejected_envelope_leaves_the_batch(tmp_path):
+    """Check that a rejected envelope leaves the batch: it is not retried."""
+    make_ext(tmp_path / "bundled", "good")
+
+    class Service(FakeService):
+        async def _handle_disaster_event(self, env):
+            raise AssertionError("the rejected envelope must not reach the host")
+
+    mgr = make_manager(tmp_path, Service(["good"]))
+    batch = [SimpleNamespace(source_id="cenc_eew"), "keep"]
+    await mgr._deliver(batch, lambda _msg: None, source_id="src_good")
+    assert batch == ["keep"]  # rejected once, the rest goes on
 
 
 async def test_stop_removes_the_registrations(tmp_path):
@@ -789,23 +830,7 @@ async def test_the_poll_loop_retries_a_failed_event(tmp_path):
     The fetch returns the envelope one time only. The host refuses it the
     first time. Only a retry of the poll loop can deliver it.
     """
-    code = """
-def setup(api):
-    entry = type("E", (), dict(
-        source_id="src_" + api.id, config_group="extensions",
-        provider_family="extension"))()
-    api.register_source(entry)
-    served = [False]
-
-    async def fetch(session):
-        if served[0]:
-            return []
-        served[0] = True
-        return ["once"]
-
-    api.register_poller("src_" + api.id, fetch, interval_seconds=0.01, timeout_seconds=0.05)
-"""
-    make_ext(tmp_path / "bundled", "retry", code)
+    make_ext(tmp_path / "bundled", "retry", ONCE_EXT)
 
     class Service(FakeService):
         def __init__(self, *a, **k):
@@ -850,23 +875,7 @@ async def test_restart_restores_the_extensions(tmp_path):
 
 async def test_pending_survives_a_stop(tmp_path):
     """Check that a failed envelope that stop() interrupts is delivered after the restart."""
-    code = """
-def setup(api):
-    entry = type("E", (), dict(
-        source_id="src_" + api.id, config_group="extensions",
-        provider_family="extension"))()
-    api.register_source(entry)
-    served = [False]
-
-    async def fetch(session):
-        if served[0]:
-            return []
-        served[0] = True
-        return ["once"]
-
-    api.register_poller("src_" + api.id, fetch, interval_seconds=0.01, timeout_seconds=0.05)
-"""
-    make_ext(tmp_path / "bundled", "hold", code)
+    make_ext(tmp_path / "bundled", "hold", ONCE_EXT)
 
     class Service(FakeService):
         def __init__(self, *a, **k):
@@ -1010,3 +1019,116 @@ def setup(api):
         assert not task.done()  # the poller keeps polling
     finally:
         await mgr.stop()
+
+
+async def test_start_and_stop_are_serialized(tmp_path):
+    """Check that a start() that runs while a stop() is in flight waits for it.
+
+    The service locks of the host (_start_lock, _stop_lock) do not exclude
+    each other. The manager guards its own session, pollers and
+    registrations: the second call waits, nothing leaks.
+    """
+    make_ext(tmp_path / "bundled", "good")
+    mgr = make_manager(tmp_path, FakeService(["good"]))
+    mgr.load_all()
+    await mgr.start()
+    tasks = list(mgr._tasks)
+    stopper = asyncio.create_task(mgr.stop())
+    await asyncio.sleep(0)  # the stop() takes the lock of the manager first
+    await mgr.start()  # it waits: no poller before the stop finished
+    assert stopper.done()  # the start ran after the stop
+    assert all(t.done() for t in tasks)  # the old pollers were cancelled
+    assert mgr._tasks and mgr._tasks != tasks  # new pollers, from the reload
+    assert list(mgr._apis) == ["good"]  # the extensions loaded again
+    await mgr.stop()
+
+
+async def test_a_stop_during_a_delivery_keeps_the_undelivered(tmp_path):
+    """Check that a stop between two envelopes keeps the one that did not finish.
+
+    The identity of the undelivered envelope is already marked seen (the
+    host marks at the fetch). The recoverable list is the guarantee: the
+    envelope waits in pending, and a restart delivers it. The
+    deduplication then skips nothing that still waits.
+    """
+    make_ext(tmp_path / "bundled", "b", IDENTITY_EXT)
+
+    class Service(FakeService):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            self.hang = True
+
+        async def _handle_disaster_event(self, env):
+            event_id = getattr(getattr(env, "identity", None), "event_id", None)
+            if event_id == "second" and self.hang:
+                await asyncio.sleep(3600)  # the stop() cancels this delivery
+            self.events.append(env)
+            return True
+
+    svc = Service(["b"], {"b": {"mode": "batch"}})
+    mgr = make_manager(tmp_path, svc)
+    mgr.load_all()
+    await mgr.start()
+    try:
+        await _wait_for(lambda: len(svc.events) >= 1)  # "first" is delivered
+    finally:
+        await mgr.stop()  # cancelled while delivering "second"
+    # The envelope that did not finish stayed in the recoverable list.
+    assert any(
+        getattr(getattr(e, "identity", None), "event_id", None) == "second"
+        for p in mgr._pending.values()
+        for e in p
+    )
+    # A restart delivers it: the interrupted delivery loses nothing.
+    svc.hang = False
+    await mgr.start()
+    try:
+        await _wait_for(lambda: len(svc.events) >= 2)
+    finally:
+        await mgr.stop()
+    assert [getattr(e, "identity", None).event_id for e in svc.events][-1] == "second"
+
+
+async def test_pending_survives_a_failed_load(tmp_path):
+    """Check that an extension that stays enabled keeps its state across a failed load.
+
+    A failed load leaves no poller. The pending envelopes stay: the
+    pollers resume with them when the extension loads again.
+    """
+    root = tmp_path / "bundled"
+    make_ext(root, "hold", ONCE_EXT)
+
+    class Service(FakeService):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            self.succeed = False
+
+        async def _handle_disaster_event(self, env):
+            if not self.succeed:
+                return False
+            self.events.append(env)
+            return True
+
+    svc = Service(["hold"])
+    mgr = make_manager(tmp_path, svc)
+    mgr.load_all()
+    await mgr.start()
+    await _wait_for(lambda: any(p for p in mgr._pending.values()))
+    await mgr.stop()
+    # The extension breaks: its load fails. Its state stays: it is enabled.
+    (root / "hold" / "extension.py").write_text(
+        "def setup(api):\n    raise RuntimeError('broken now')\n", encoding="utf-8"
+    )
+    mgr.load_all()
+    assert {r["id"]: r["state"] for r in mgr.status()}["hold"] == "error"
+    assert any(p for p in mgr._pending.values())  # nothing was dropped
+    # The extension recovers: the envelope that waited is delivered.
+    (root / "hold" / "extension.py").write_text(ONCE_EXT, encoding="utf-8")
+    svc.succeed = True
+    mgr.load_all()
+    await mgr.start()
+    try:
+        await _wait_for(lambda: "once" in svc.events)
+    finally:
+        await mgr.stop()
+    assert "once" in svc.events
