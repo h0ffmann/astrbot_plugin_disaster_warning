@@ -72,6 +72,7 @@ class ExtensionManager:
     DELIVERY_TIMEOUT_SECONDS = (
         60  # Maximum seconds for one event in the host event pipeline
     )
+    STOP_TIMEOUT_SECONDS = 60  # Maximum seconds to wait for cancelled pollers at a stop
 
     def __init__(
         self,
@@ -490,12 +491,27 @@ class ExtensionManager:
         The failed envelopes and the delivered identities of the polling tasks
         stay in the manager: a start() of this manager (a service restart)
         continues where the pollers stopped.
+
+        The wait for the cancelled tasks is bounded (STOP_TIMEOUT_SECONDS): a
+        task that ignores the cancellation cannot hold this lock, and the
+        shutdown of the host, forever. On timeout, the manager logs the
+        tasks that are still running and continues; it does not assume that
+        they completed.
         """
         async with self._lifecycle_lock:
             tasks, self._tasks = self._tasks, []
             for t in tasks:
                 t.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
+            if tasks:
+                _done, still_running = await asyncio.wait(
+                    tasks, timeout=self.STOP_TIMEOUT_SECONDS
+                )
+                if still_running:
+                    unfinished = [t.get_name() for t in still_running]
+                    logger.warning(
+                        f"[灾害预警] 停机等待轮询任务超时"
+                        f"（>{self.STOP_TIMEOUT_SECONDS}s），继续停机。未完成的任务: {unfinished}"
+                    )
             if self._session is not None:
                 await self._session.close()
                 self._session = None
@@ -512,7 +528,9 @@ class ExtensionManager:
         extension that returns the current alert snapshot does not push an
         unchanged alert twice. The pending list and the delivered identities
         live in the manager: they survive a stop() and the restart of the
-        pollers.
+        pollers. During the startup silence of the host, the retry of the
+        pending list waits: the host would absorb an envelope (True, no
+        push) and the envelope would be lost.
         """
         failures = 0
         last_log = float("-inf")
@@ -531,9 +549,14 @@ class ExtensionManager:
 
         while True:
             try:
-                if pending:
+                silencing = self._is_silencing()
+                if pending and not silencing:
                     # Retry the envelopes that the host refused. A retry that
                     # the host handles leaves the list inside _deliver().
+                    # The startup silence does not retry: the host would
+                    # absorb an envelope of this list (True, no push) and
+                    # the envelope would be lost. The retry waits for the
+                    # silence to end.
                     await self._deliver(
                         pending, log_throttled, source_id=spec.source_id
                     )
@@ -549,9 +572,25 @@ class ExtensionManager:
                     # the first delivery: a stop during the delivery keeps
                     # every envelope that did not finish.
                     pending += fresh
-                    await self._deliver(
-                        pending, log_throttled, source_id=spec.source_id
-                    )
+                    if silencing:
+                        # The startup silence of the host absorbs a new
+                        # envelope (True, no push) and seeds the
+                        # deduplication: the existing behavior for a new
+                        # snapshot. Deliver only the fresh window: an
+                        # envelope of the pending list must not take part,
+                        # because the absorb would drop it. The sync removes
+                        # the envelopes that the host absorbed; the others
+                        # stay for a retry after the silence.
+                        head = len(pending) - len(fresh)
+                        window = pending[head:]
+                        await self._deliver(
+                            window, log_throttled, source_id=spec.source_id
+                        )
+                        pending[head:] = window
+                    else:
+                        await self._deliver(
+                            pending, log_throttled, source_id=spec.source_id
+                        )
                 if len(pending) > self.MAX_PENDING_ENVELOPES:
                     # Too many failed events in one cycle: keep the newest
                     # and say what was dropped. The host does not drop them in silence.
@@ -571,6 +610,16 @@ class ExtensionManager:
                 log_throttled(f"拉取失败: {type(e).__name__}: {e}")
             factor = min(2**failures, self.MAX_BACKOFF_FACTOR) if failures else 1
             await asyncio.sleep(spec.interval_seconds * factor)
+
+    def _is_silencing(self) -> bool:
+        """The host is in its startup silence period.
+
+        The host arms the silence before it starts the extension pollers,
+        so the first poll cycles of a start run inside the silence window.
+        The host absorbs an event (True, no push) while the silence lasts.
+        """
+        is_silencing = getattr(self.service, "is_silencing", None)
+        return callable(is_silencing) and bool(is_silencing())
 
     def _mark_seen(self, seen: dict[str, None], envelope: Any) -> bool:
         """Mark the identity of an envelope as seen. Return False when the host already delivered it.

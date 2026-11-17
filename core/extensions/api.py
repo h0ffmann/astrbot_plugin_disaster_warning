@@ -141,6 +141,10 @@ class ExtensionAPI:
             raise PermissionError("register_poller 需要在 permissions 中声明 network")
         if source_id not in self.sources:
             raise ValueError(f"source_id 未由本扩展注册: {source_id}")
+        if any(spec.source_id == source_id for spec in self.pollers):
+            # One polling task owns one pending queue: two pollers of the
+            # same source would delete the pending items of each other.
+            raise ValueError(f"source_id 已注册轮询任务: {source_id}")
         self.pollers.append(
             PollerSpec(
                 source_id,

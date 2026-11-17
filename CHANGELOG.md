@@ -29,6 +29,9 @@
 ### 🛡️ Reliability (可靠性)
 
 - The pollers deliver only new or changed events: the host keeps the identities that a poller already delivered and skips an unchanged alert snapshot; an update with a new `published_at` passes by @h0ffmann
+- One polling task owns one pending queue: an extension that registers two pollers for one source now gets an error, because the two tasks would delete the pending items of each other by @h0ffmann
+- The wait of `stop()` for the cancelled polling tasks is bounded: a task that ignores the cancellation can no longer hold the lifecycle lock, and the shutdown of the host, forever. On timeout the manager logs the tasks still running and continues by @h0ffmann
+- The startup silence no longer drops a recovered pending envelope: the poller retries the historical envelopes only after the silence ends, while a new snapshot keeps the silent (absorbed) behavior by @h0ffmann
 - A delivery that the host does not finish within one minute returns to the poller and is retried at the next poll: a stalled handler does not stop the collection of alerts by @h0ffmann
 - An envelope whose `source_id` is not the source of its polling task is rejected: an extension cannot speak for another source by @h0ffmann
 - More than 100 failed envelopes in one polling cycle keep the newest and log the count that was dropped: no silent discard by @h0ffmann
@@ -50,6 +53,7 @@
 
 - Add the extension guide in `docs/extensions/` and the extension entries to the README by @h0ffmann
 - Write the poller contract: what a poller returns, when the host skips an event, and how updates pass by @h0ffmann
+- The extension documents state the scope of the pending cap: it runs only at the end of a poll cycle whose `fetch` also succeeded, so while fetches keep failing the queue can stay above 100 by @h0ffmann
 
 ### 🔧 Chore (杂项)
 

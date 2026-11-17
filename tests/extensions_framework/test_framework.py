@@ -225,6 +225,27 @@ def setup(api):
 """
 
 
+SILENCE_EXT = """
+def setup(api):
+    entry = type("E", (), dict(
+        source_id="src_" + api.id, config_group="extensions",
+        provider_family="extension"))()
+    api.register_source(entry)
+
+    async def fetch(session):
+        mode = api.config.get("mode")
+        if mode == "stuck" and not api.config.get("served"):
+            api.config["served"] = True
+            return ["stuck_env"]
+        if mode == "fresh" and not api.config.get("served_fresh"):
+            api.config["served_fresh"] = True
+            return ["fresh_env"]
+        return []
+
+    api.register_poller("src_" + api.id, fetch, interval_seconds=0.01, timeout_seconds=0.05)
+"""
+
+
 def make_ext(root, ext_id, code=POLLER_EXT, *, permissions=("network",), **manifest):
     """Write a test extension package to disk."""
     d = root / ext_id
@@ -1132,3 +1153,121 @@ async def test_pending_survives_a_failed_load(tmp_path):
     finally:
         await mgr.stop()
     assert "once" in svc.events
+
+
+def test_a_second_poller_of_one_source_is_rejected(tmp_path):
+    """Check that one source registers one polling task.
+
+    Two pollers of the same source would share the pending queue of the
+    label: each one would delete the pending items of the other.
+    """
+    code = """
+def setup(api):
+    entry = type("E", (), dict(
+        source_id="src_" + api.id, config_group="extensions",
+        provider_family="extension"))()
+    api.register_source(entry)
+
+    async def fetch(session):
+        return []
+
+    api.register_poller("src_" + api.id, fetch, interval_seconds=0.01)
+    api.register_poller("src_" + api.id, fetch, interval_seconds=0.01)
+"""
+    make_ext(tmp_path / "bundled", "dup", code)
+    mgr = make_manager(tmp_path, FakeService(["dup"]))
+    mgr.load_all()
+    rows = {row["id"]: row for row in mgr.status()}
+    assert rows["dup"]["state"] == "error"
+    assert "已注册轮询任务" in rows["dup"]["error"]
+
+
+async def test_stop_waits_at_most_the_stop_timeout(tmp_path, monkeypatch):
+    """Check that a task that ignores the cancellation cannot hold the stop.
+
+    The wait for the cancelled tasks is bounded. On timeout the manager
+    logs the tasks that are still running and continues: the session and
+    the registrations go. It does not assume that the task completed.
+    """
+    monkeypatch.setattr(manager_mod.ExtensionManager, "STOP_TIMEOUT_SECONDS", 0.05)
+    make_ext(tmp_path / "bundled", "hung", POLLER_EXT)
+    reg = StatefulRegistry()
+    mgr = make_manager(tmp_path, FakeService(["hung"]), reg)
+    mgr.load_all()
+    assert reg.sources == {"src_hung": "hung"}  # the registration is there
+
+    release = asyncio.Event()
+
+    async def swallow():
+        while True:
+            try:
+                await asyncio.sleep(3600)
+            except asyncio.CancelledError:
+                if release.is_set():
+                    raise
+                # swallow: the task does not finish
+
+    hung = asyncio.create_task(swallow(), name="ext-poller-hung-src_hung")
+    mgr._tasks.append(hung)
+    await asyncio.sleep(0)  # the task starts
+    await mgr.stop()  # the bounded wait returns: it does not hang
+    assert mgr._tasks == [] and mgr._session is None
+    assert reg.sources == {}  # the registrations are gone anyway
+    assert not hung.done()  # the manager did not assume its completion
+    # Teardown: the task ends when the test releases it.
+    release.set()
+    hung.cancel()
+    await asyncio.gather(hung, return_exceptions=True)
+
+
+async def test_startup_silence_keeps_the_pending_envelopes(tmp_path):
+    """Check that the startup silence does not drop a historical envelope.
+
+    The host arms the silence before it starts the pollers, and
+    _handle_disaster_event() returns True (it absorbs, no push) while the
+    silence lasts. The retry of the pending list waits for the silence to
+    end: an absorb would drop the envelope. A new snapshot keeps the
+    silent behavior: the host absorbs it.
+    """
+    make_ext(tmp_path / "bundled", "sil", SILENCE_EXT)
+    settings = {"sil": {"mode": "stuck"}}
+
+    class Service(FakeService):
+        def __init__(self):
+            super().__init__(["sil"], settings)
+            self.silencing = False
+            self.accept = False
+
+        def is_silencing(self):
+            return self.silencing
+
+        async def _handle_disaster_event(self, env):
+            if self.silencing:
+                return True  # the silence absorbs: handled, but no push
+            if not self.accept:
+                return False  # the envelope waits in pending
+            self.events.append(env)
+            return True
+
+    svc = Service()
+    mgr = make_manager(tmp_path, svc)
+    mgr.load_all()
+    await mgr.start()
+    try:
+        # One envelope is refused outside the silence: it waits in pending.
+        await _wait_for(lambda: any(p for p in mgr._pending.values()))
+        assert svc.events == []
+        # The silence returns. A new snapshot is fetched during the silence.
+        svc.silencing = True
+        settings["sil"]["mode"] = "fresh"
+        await asyncio.sleep(0.2)  # several cycles inside the silence
+        assert svc.events == []  # no push during the silence
+        # The new snapshot was absorbed: it left the pending list.
+        assert mgr._pending == {"sil/src_sil": ["stuck_env"]}
+        # The silence ends: the retry delivers the historical envelope.
+        svc.silencing = False
+        svc.accept = True
+        await _wait_for(lambda: "stuck_env" in svc.events)
+    finally:
+        await mgr.stop()
+    assert "stuck_env" in svc.events

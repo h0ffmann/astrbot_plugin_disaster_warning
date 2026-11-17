@@ -152,6 +152,8 @@ class ExtensionAPI:
 - `register_source` raises ValueError if `entry.config_group` is not `"extensions"`.
   It also raises ValueError if `entry.provider_family` is not `ProviderFamily.EXTENSION`.
 - `register_poller` needs `"network"` in `permissions`. The same extension must register the `source_id` first.
+  One extension registers one poller per `source_id`: a second poller of the same `source_id` raises ValueError.
+  One polling task owns one pending queue.
 - `t()` looks for the key in this sequence:
   1. `locale/<lang>.json`. `lang` is `config.get("language")`. If it is not set, `lang` is the host language `zh-CN`.
   2. `locale/zh-CN.json` (the host language).
@@ -185,6 +187,12 @@ class ExtensionAPI:
   starts one asyncio task for each poller:
   - All pollers share one `aiohttp.ClientSession` with the `certifi` root certificates.
   - The manager calls `fetch` with `asyncio.wait_for(timeout_seconds)`.
+  - The host arms its startup silence **before** it starts the pollers. During the
+    silence, `_handle_disaster_event()` returns `True` and absorbs an event without a
+    push: it seeds the deduplication. A new snapshot keeps this silent behavior. The
+    retry of the historical `pending` envelopes waits for the silence to end: the host
+    would absorb a historical envelope and drop it. Envelopes that the silence did not
+    absorb stay in `pending` and are delivered after the silence.
   - Each polling task records the identity (`unique_key` plus `published_at`, or `unique_key`
     when `published_at` is empty) when `fetch()` returns an envelope, before delivery. Each
     polling task keeps only the **1024 most recently recorded identities** (`MAX_SEEN_EVENTS`).
@@ -202,14 +210,14 @@ class ExtensionAPI:
   - An envelope whose `source_id` does not match the `source_id` of the polling task is removed
     from `pending` and rejected. An extension cannot speak for another source, built-in or
     extension.
-  - An envelope whose delivery returns `False`, times out, or raises stays in `pending` for the
-    next poll. Retries from `pending` do not check `_seen` again. After the delivery step of a
-    poll cycle finishes, `pending` keeps at most the newest 100 envelopes
-    (`MAX_PENDING_ENVELOPES`) and drops older ones. If `stop()` cancels the task during
-    delivery, `pending` can hold more than 100 envelopes until the next poll finishes its
-    delivery step. The drop warning shares the per-poller log throttle
-    (`LOG_THROTTLE_SECONDS = 600`) with fetch and delivery warnings. Thus, the dropped count is
-    logged only when the throttle allows a warning in that period.
+  - An envelope whose delivery returns `False`, times out, or raises stays in `pending`
+    for the next poll. Retries from `pending` do not check `_seen` again. At the end of
+    a poll cycle whose `fetch` also succeeded, `pending` keeps at most the newest 100
+    envelopes (`MAX_PENDING_ENVELOPES`) and drops older ones. A `stop()` that cancels a
+    delivery in flight, or a `fetch` that raises, skips the truncation of that cycle.
+    While fetches keep failing, the queue can stay above 100: the value is a working cap,
+    not a hard memory limit. The drop warning shares the per-poller log throttle
+    (`LOG_THROTTLE_SECONDS = 600`) with fetch and delivery warnings.
   - If `fetch` raises an exception, the manager logs a throttled warning (at most one per
     `LOG_THROTTLE_SECONDS` period). It then waits with exponential backoff (`2**failures` times
     the interval, up to 10 times the interval). A poller task does not stop on an exception.
@@ -220,9 +228,12 @@ class ExtensionAPI:
     manager with empty memory. An extension that wants an event delivered after a reload must
     return it again.
 - `stop()` cancels the poller tasks, closes the HTTP session, and unregisters the extension
-  sources, parsers, presenters and rules. During shutdown, `DisasterServiceLifecycle` calls
-  `weather_agg.flush_all()` **before** `extension_manager.stop()`, so buffered extension weather
-  events still resolve their extension sources and presenters.
+  sources, parsers, presenters and rules. The wait for the cancelled tasks is bounded
+  (`STOP_TIMEOUT_SECONDS`): a task that ignores the cancellation cannot hold the lifecycle
+  lock forever. On timeout, the manager logs the tasks that are still running and continues.
+  During shutdown, `DisasterServiceLifecycle` calls `weather_agg.flush_all()` **before**
+  `extension_manager.stop()`, so buffered extension weather events still resolve their
+  extension sources and presenters.
 - `status() -> list[dict]` gives `[{id, name, version, state, error, sources}]`.
   `state` is `"loaded"`, `"error"`, `"not_found"` or `"disabled"`. The admin command `/灾害预警扩展` shows this list.
 
