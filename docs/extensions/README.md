@@ -1,13 +1,20 @@
 # How to write an extension
 
 An extension adds data sources, presenters and rules to this plugin. You do not need a fork.
-The contract is in [`design.md`](design.md). The reference implementation is
-[`extensions/br_rs`](../../extensions/br_rs) (Brazil, Rio Grande do Sul).
+The contract is in [`design.md`](design.md).
 
-The API documents of the data sources of `br_rs` are:
+This repository has the extension system, but no business extension. Each extension is in a separate
+repository, and its author maintains it.
 
-- [CEMADEN API](../CEMADEN%20API.md): the alerts and the rain gauges.
-- [NOAA CPC ONI](../NOAA%20CPC%20ONI.md): the El Niño and La Niña index.
+## Community extensions
+
+| Extension | Coverage | Author |
+| :--- | :--- | :--- |
+| [`br_south_disaster`](https://github.com/h0ffmann/astrbot_dw_ext_br_south_disaster) | CEMADEN rain, flood and landslide alerts for the South of Brazil | [@h0ffmann](https://github.com/h0ffmann) |
+| [`br_south_waterq`](https://github.com/h0ffmann/astrbot_dw_ext_br_south_waterq) | Bathing water quality alerts for the South of Brazil | [@h0ffmann](https://github.com/h0ffmann) |
+
+These two repositories are also complete examples. This list is not a security review. An extension
+runs as Python code in the same process as the plugin.
 
 ## 1. Enable an extension
 
@@ -15,8 +22,8 @@ Open the plugin configuration (WebUI → 🧩 扩展, key `extensions`). Set the
 
 ```json
 "extensions": {
-  "enabled_ids": ["br_rs"],
-  "settings": "{\"br_rs\": {\"language\": \"en\", \"alerts_interval\": 300}}"
+  "enabled_ids": ["my_ext"],
+  "settings": "{\"my_ext\": {\"language\": \"en\"}}"
 }
 ```
 
@@ -24,7 +31,8 @@ Reload the plugin. Then send `/灾害预警扩展`. The command shows the state 
 
 - 🟢: the extension is loaded.
 - 🔴: an error occurred. The command shows the error message.
-- ⚪: the host did not find the extension.
+- ⚪: the extension is in `enabled_ids`, but the host did not find it.
+- ⚫: the extension is on disk, but it is not in `enabled_ids`. The host does not import it.
 
 A broken extension does not stop the host.
 
@@ -50,6 +58,7 @@ version: 0.1.0
 api_version: 1
 min_host_version: 1.6.5
 permissions: [network]
+dependencies: []  # optional; extension ids that must load first
 ```
 
 ```python
@@ -80,7 +89,7 @@ def setup(api):
     api.register_poller("my_ext_rain", fetch, interval_seconds=300)
 ```
 
-Make the envelopes in the same way as `extensions/br_rs/extension.py`:
+Make the envelopes in the same way as [`envelopes.py`](https://github.com/h0ffmann/astrbot_dw_ext_br_south_disaster/blob/main/envelopes.py) of `br_south_disaster`:
 
 - Use an `EventIdentity` with `event_type="weather_alarm"` and `provider_family="extension"`.
 - Use a `WeatherEvent`. Set `metadata["severity_level"]` to a value from 0 to 4
@@ -93,15 +102,51 @@ Make the envelopes in the same way as `extensions/br_rs/extension.py`:
     Thus, use the time of the *last update* as the event time.
   - The minimum color level. The host uses `severity_level`.
   - The keyword filters.
+  - Your rules run in their registration order. If a rule raises or returns a
+    value that is not a `RuleDecision`, the host logs a warning and accepts the
+    event. Thus, a broken rule does not block the events of the other sources.
 - Push: session targets and weather aggregation.
 - Reliability:
   - One shared HTTP session.
   - A timeout for each fetch.
+  - A timeout of one minute for each delivery to the host. A delivery that
+    stalls stays in `pending` and is tried again at the next poll.
   - A longer wait after each failure (exponential backoff).
-  - Not more than one error log message in each period.
+  - Not more than one error log message in each 600-second period per poller.
+  - An event that the host did not handle stays in `pending` and goes to the
+    host again at the next poll. After the delivery step of a poll finishes,
+    your poller caps `pending` at the newest 100 events and drops older ones. If
+    a stop cancels a delivery in flight, `pending` can exceed 100 until the next
+    poll finishes delivery. The drop warning shares the 600-second log throttle
+    with fetch and delivery errors.
+  - `pending` and the recorded identities live in the memory of the manager.
+    They survive a stop and a start of the same manager instance, and they
+    survive a failed reload when your extension stays in `enabled_ids`. A
+    reload of the plugin or a new process creates a new manager with empty
+    memory; return any event that you still want delivered.
 - Translation: `api.t(key, **fmt)` looks in `locale/<language>.json`, then in `locale/zh-CN.json`.
-  For numbers and dates, `br_rs` reads the keys `format.decimal` and `format.time` from the locale file.
-  If it does not find the key, it gives the key itself.
+  If `api.t` does not find the key, it gives the key itself.
+
+### The fetch contract
+
+Prefer to return only **new or changed** events. Each polling task records the
+identity (`unique_key` plus `published_at`, or `unique_key` when `published_at`
+is empty) when `fetch()` returns an envelope, before delivery. Each polling task
+keeps only the **1024 most recently recorded identities**:
+
+- An alert that `fetch()` returns again while its identity is among those 1024
+  identities is skipped. Because the identity is recorded at fetch time,
+  envelopes whose delivery fails or is rejected also take a slot in those 1024
+  identities. Failed envelopes are retried from `pending`. Once more than 1024
+  newer identities are recorded, the oldest identity is evicted, and returning
+  it again delivers it again.
+- An update of the same alert passes when you give the same `event_id` a new
+  `published_at`, such as the last update time of the alert.
+- An envelope whose `source_id` is not the source of your poller is rejected.
+  Build the envelope for the source that you registered.
+
+Also, do not let one event have the identity of another source: the identity
+`unique_key` is `source_id|event_type|event_id|report_num`.
 
 ## 4. Tests
 
@@ -112,5 +157,26 @@ uv venv .venv && uv pip install --python .venv/bin/python -r requirements-dev.tx
 .venv/bin/python -m pytest -q
 ```
 
-For tests of parsers with recorded data and a fake `api`, see `tests/br_rs/`.
+For tests of parsers with recorded data and a fake `api`, see the `tests` directory of [`br_south_disaster`](https://github.com/h0ffmann/astrbot_dw_ext_br_south_disaster/tree/main/tests).
 For a test that loads an extension through the real host, see `tests/test_extension_integration.py`.
+
+## 5. Publish an extension
+
+Put the extension in a separate repository. The repository root is the extension root:
+
+```text
+astrbot_dw_ext_<id>/
+  extension.yaml
+  __init__.py
+  extension.py
+  locale/zh-CN.json
+  README.md
+  LICENSE
+```
+
+- The repository name is `astrbot_dw_ext_<id>`. The `id` in `extension.yaml` is the same value.
+- Use underscores, not hyphens. The host imports the `id` as a Python package name.
+- Do not change an `id` after a release.
+- Make a tag `v<version>` that is the same as `version` in `extension.yaml`.
+- A zip file has one top-level directory, with the name `<id>`.
+- The README tells the data sources and the settings. It also tells that the data is for reference only.
