@@ -114,11 +114,17 @@ Make the envelopes in the same way as [`envelopes.py`](https://github.com/h0ffma
   - A longer wait after each failure (exponential backoff).
   - Not more than one error log message in each 600-second period per poller.
   - An event that the host did not handle stays in `pending` and goes to the
-    host again at the next poll. After the delivery step of a poll finishes,
-    your poller caps `pending` at the newest 100 events and drops older ones. If
-    a stop cancels a delivery in flight, `pending` can exceed 100 until the next
-    poll finishes delivery. The drop warning shares the 600-second log throttle
-    with fetch and delivery errors.
+    host again at the next poll. After a poll finishes its delivery step and
+    its fetch, your poller caps `pending` at the newest 100 events and drops
+    older ones. A stop that cancels a delivery in flight, or a fetch that
+    raises, skips the cap of that cycle. While fetches keep failing, the queue
+    can stay above 100: it is a working cap, not a hard memory limit. The drop
+    warning shares the 600-second log throttle with fetch and delivery errors.
+  - The host silences its own startup, and it starts your pollers inside that
+    silence. A new event that you return during the silence is absorbed (no
+    push, no error): the host learns its state. An event that the host did not
+    handle waits in `pending` until the silence ends, and the next poll
+    delivers it.
   - `pending` and the recorded identities live in the memory of the manager.
     They survive a stop and a start of the same manager instance, and they
     survive a failed reload when your extension stays in `enabled_ids`. A
